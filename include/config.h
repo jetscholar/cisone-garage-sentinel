@@ -1,7 +1,7 @@
 #pragma once
 
 #define PROJECT_NAME "cisone-garage-sentinel"
-#define FW_VERSION   "0.1.0-phase1"
+#define FW_VERSION "0.1.1"
 
 #define SERIAL_BAUD 115200
 

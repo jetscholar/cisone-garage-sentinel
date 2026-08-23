@@ -340,7 +340,8 @@ Major version `1.0.0` should represent the first stable garage security-node rel
 
 | Date | Version | Commit name | Milestone / Notes |
 |---|---|---|---|
-| 2026-08-23 | `0.1.0-phase1` | `Initialize ESP32-S3 hardware baseline` | Created the new `cisone-garage-sentinel` PlatformIO project. Defined the ground-up development strategy, project structure, N16R8 hardware-validation phase, and mandatory audible-INMP441 milestone. |
+| 2026-08-23 | `0.1.0` | `Initialize cisone-garage-sentinel repository` | Created the new PlatformIO project structure, README, phase milestones, configuration layout, and initial ESP32-S3 baseline firmware. |
+| 2026-08-24 | `0.1.1` | `Verify ESP32-S3 N16R8 hardware baseline` | Confirmed ESP32-S3 dual-core operation at 240 MHz, 16 MB flash, 8 MB PSRAM, successful 1 MiB PSRAM write/read test, stable serial output and stable heartbeat. Phase 1 complete. |
 
 Add one row for each meaningful tested commit rather than every minor edit.
 
