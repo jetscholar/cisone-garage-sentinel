@@ -1,168 +1,360 @@
 #include <Arduino.h>
-#include <esp_heap_caps.h>
+#include <math.h>
 
+#include "driver/i2s.h"
 #include "config.h"
 
 
 // ============================================================
-// Helpers
+// Per-channel accumulated statistics
 // ============================================================
 
-static float bytesToMiB(size_t bytes)
+struct ChannelStats
 {
-    return static_cast<float>(bytes) / (1024.0f * 1024.0f);
+    uint64_t samples = 0;
+
+    int32_t minSample = INT32_MAX;
+    int32_t maxSample = INT32_MIN;
+
+    int64_t peak = 0;
+
+    long double sum = 0.0;
+    long double sumSquares = 0.0;
+
+    uint64_t low7Zero = 0;
+    uint64_t low8Zero = 0;
+};
+
+
+static void resetStats(ChannelStats& s)
+{
+    s.samples = 0;
+
+    s.minSample = INT32_MAX;
+    s.maxSample = INT32_MIN;
+
+    s.peak = 0;
+
+    s.sum = 0.0;
+    s.sumSquares = 0.0;
+
+    s.low7Zero = 0;
+    s.low8Zero = 0;
 }
 
 
 // ============================================================
-// PSRAM test
+// Add raw 32-bit word
 // ============================================================
 
-static bool testPsram()
+static void addSample(
+    ChannelStats& stats,
+    int32_t raw
+)
 {
-    Serial.println();
-    Serial.println("---- PSRAM memory test ----");
-
-    if (!psramFound())
+    if (raw < stats.minSample)
     {
-        Serial.println("FAIL: PSRAM not detected.");
-        return false;
+        stats.minSample = raw;
     }
 
+    if (raw > stats.maxSample)
+    {
+        stats.maxSample = raw;
+    }
+
+
+    int64_t magnitude =
+        static_cast<int64_t>(raw);
+
+    if (magnitude < 0)
+    {
+        magnitude = -magnitude;
+    }
+
+    if (magnitude > stats.peak)
+    {
+        stats.peak = magnitude;
+    }
+
+
+    stats.sum +=
+        static_cast<long double>(raw);
+
+    stats.sumSquares +=
+        static_cast<long double>(raw) *
+        static_cast<long double>(raw);
+
+
+    const uint32_t u =
+        static_cast<uint32_t>(raw);
+
+    if ((u & 0x7F) == 0)
+    {
+        ++stats.low7Zero;
+    }
+
+    if ((u & 0xFF) == 0)
+    {
+        ++stats.low8Zero;
+    }
+
+
+    ++stats.samples;
+}
+
+
+// ============================================================
+// Print one channel
+// ============================================================
+
+static void printStats(
+    const char* name,
+    const ChannelStats& stats
+)
+{
+    if (stats.samples == 0)
+    {
+        Serial.printf(
+            "%s: no samples\n",
+            name
+        );
+
+        return;
+    }
+
+
+    const long double count =
+        static_cast<long double>(
+            stats.samples
+        );
+
+
+    const double mean =
+        static_cast<double>(
+            stats.sum / count
+        );
+
+
+    const double rms =
+        sqrt(
+            static_cast<double>(
+                stats.sumSquares / count
+            )
+        );
+
+
+    const double low7Percent =
+        100.0 *
+        static_cast<double>(
+            stats.low7Zero
+        ) /
+        static_cast<double>(
+            stats.samples
+        );
+
+
+    const double low8Percent =
+        100.0 *
+        static_cast<double>(
+            stats.low8Zero
+        ) /
+        static_cast<double>(
+            stats.samples
+        );
+
+
     Serial.printf(
-        "Allocating %u bytes (%.2f MiB) in PSRAM...\n",
-        static_cast<unsigned>(PSRAM_TEST_SIZE),
-        bytesToMiB(PSRAM_TEST_SIZE)
+        "%s\n",
+        name
     );
 
-    uint8_t* buffer = static_cast<uint8_t*>(
-        heap_caps_malloc(
-            PSRAM_TEST_SIZE,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT
+    Serial.printf(
+        "  samples       : %llu\n",
+        static_cast<unsigned long long>(
+            stats.samples
         )
     );
 
-    if (buffer == nullptr)
-    {
-        Serial.println("FAIL: PSRAM allocation failed.");
-        return false;
-    }
+    Serial.printf(
+        "  raw range     : %ld .. %ld\n",
+        static_cast<long>(
+            stats.minSample
+        ),
+        static_cast<long>(
+            stats.maxSample
+        )
+    );
 
-    Serial.println("Writing test pattern...");
+    Serial.printf(
+        "  mean/DC       : %.1f\n",
+        mean
+    );
 
-    for (size_t i = 0; i < PSRAM_TEST_SIZE; ++i)
-    {
-        buffer[i] = static_cast<uint8_t>(i & 0xFF);
-    }
+    Serial.printf(
+        "  RMS           : %.1f\n",
+        rms
+    );
 
-    Serial.println("Verifying test pattern...");
+    Serial.printf(
+        "  absolute peak : %lld\n",
+        static_cast<long long>(
+            stats.peak
+        )
+    );
 
-    for (size_t i = 0; i < PSRAM_TEST_SIZE; ++i)
-    {
-        const uint8_t expected = static_cast<uint8_t>(i & 0xFF);
+    Serial.printf(
+        "  low 7 zero    : %.1f %%\n",
+        low7Percent
+    );
 
-        if (buffer[i] != expected)
-        {
-            Serial.printf(
-                "FAIL: PSRAM mismatch at byte %u: expected %u, got %u\n",
-                static_cast<unsigned>(i),
-                static_cast<unsigned>(expected),
-                static_cast<unsigned>(buffer[i])
-            );
-
-            heap_caps_free(buffer);
-            return false;
-        }
-    }
-
-    heap_caps_free(buffer);
-
-    Serial.println("PASS: PSRAM write/read verification succeeded.");
-    return true;
+    Serial.printf(
+        "  low 8 zero    : %.1f %%\n",
+        low8Percent
+    );
 }
 
 
 // ============================================================
-// Hardware report
+// I2S setup
 // ============================================================
 
-static void printHardwareReport()
+static bool setupMicrophone()
 {
     Serial.println();
-    Serial.println("================================================");
-    Serial.println(PROJECT_NAME);
-    Serial.printf("Firmware: %s\n", FW_VERSION);
-    Serial.println("================================================");
-
-    Serial.println();
-    Serial.println("---- ESP32 ----");
-
-    Serial.printf("Chip model       : %s\n", ESP.getChipModel());
-    Serial.printf("Chip revision    : %u\n", ESP.getChipRevision());
-    Serial.printf("CPU cores        : %u\n", ESP.getChipCores());
-    Serial.printf("CPU frequency    : %u MHz\n", ESP.getCpuFreqMHz());
-    Serial.printf("Arduino SDK      : %s\n", ESP.getSdkVersion());
-
-    Serial.println();
-    Serial.println("---- Flash ----");
-
-    const size_t flashSize = ESP.getFlashChipSize();
-
-    Serial.printf(
-        "Flash size       : %u bytes (%.2f MiB)\n",
-        static_cast<unsigned>(flashSize),
-        bytesToMiB(flashSize)
+    Serial.println(
+        "---- ICS-43434 I2S setup ----"
     );
 
-    Serial.printf(
-        "Flash speed      : %u MHz\n",
-        static_cast<unsigned>(ESP.getFlashChipSpeed() / 1000000)
-    );
 
-    Serial.println();
-    Serial.println("---- Internal RAM ----");
+    const i2s_config_t i2sConfig = {
+        .mode = static_cast<i2s_mode_t>(
+            I2S_MODE_MASTER |
+            I2S_MODE_RX
+        ),
 
-    Serial.printf(
-        "Heap size        : %u bytes\n",
-        static_cast<unsigned>(ESP.getHeapSize())
-    );
+        .sample_rate =
+            MIC_SAMPLE_RATE,
 
-    Serial.printf(
-        "Free heap        : %u bytes\n",
-        static_cast<unsigned>(ESP.getFreeHeap())
-    );
+        .bits_per_sample =
+            I2S_BITS_PER_SAMPLE_32BIT,
 
-    Serial.printf(
-        "Minimum free heap: %u bytes\n",
-        static_cast<unsigned>(ESP.getMinFreeHeap())
-    );
+        // Capture both slots so we do not assume
+        // the SEL polarity or ESP32 slot ordering.
+        .channel_format =
+            I2S_CHANNEL_FMT_RIGHT_LEFT,
 
-    Serial.println();
-    Serial.println("---- PSRAM ----");
+        .communication_format =
+            I2S_COMM_FORMAT_STAND_I2S,
 
-    const bool psramPresent = psramFound();
+        .intr_alloc_flags =
+            ESP_INTR_FLAG_LEVEL1,
 
-    Serial.printf(
-        "PSRAM detected   : %s\n",
-        psramPresent ? "YES" : "NO"
-    );
+        .dma_buf_count =
+            MIC_DMA_BUFFER_COUNT,
 
-    if (psramPresent)
+        .dma_buf_len =
+            MIC_DMA_BUFFER_LENGTH,
+
+        .use_apll = false,
+
+        .tx_desc_auto_clear = false,
+
+        .fixed_mclk = 0
+    };
+
+
+    const i2s_pin_config_t pinConfig = {
+        .bck_io_num =
+            MIC_PIN_SCK,
+
+        .ws_io_num =
+            MIC_PIN_WS,
+
+        .data_out_num =
+            I2S_PIN_NO_CHANGE,
+
+        .data_in_num =
+            MIC_PIN_SD
+    };
+
+
+    esp_err_t result =
+        i2s_driver_install(
+            MIC_I2S_PORT,
+            &i2sConfig,
+            0,
+            nullptr
+        );
+
+
+    if (result != ESP_OK)
     {
         Serial.printf(
-            "PSRAM size       : %u bytes (%.2f MiB)\n",
-            static_cast<unsigned>(ESP.getPsramSize()),
-            bytesToMiB(ESP.getPsramSize())
+            "FAIL: i2s_driver_install(): %s\n",
+            esp_err_to_name(result)
         );
 
-        Serial.printf(
-            "Free PSRAM       : %u bytes (%.2f MiB)\n",
-            static_cast<unsigned>(ESP.getFreePsram()),
-            bytesToMiB(ESP.getFreePsram())
-        );
+        return false;
     }
 
-    Serial.println();
+
+    result =
+        i2s_set_pin(
+            MIC_I2S_PORT,
+            &pinConfig
+        );
+
+
+    if (result != ESP_OK)
+    {
+        Serial.printf(
+            "FAIL: i2s_set_pin(): %s\n",
+            esp_err_to_name(result)
+        );
+
+        return false;
+    }
+
+
+    i2s_zero_dma_buffer(
+        MIC_I2S_PORT
+    );
+
+
+    Serial.printf(
+        "Sample rate : %u Hz\n",
+        MIC_SAMPLE_RATE
+    );
+
+    Serial.println(
+        "Word size   : 32 bit"
+    );
+
+    Serial.println(
+        "Slot format : RIGHT_LEFT"
+    );
+
+    Serial.println(
+        "Processing  : raw / none"
+    );
+
+    Serial.printf(
+        "DOUT/SD     : GPIO%d\n",
+        MIC_PIN_SD
+    );
+
+    Serial.printf(
+        "BCLK        : GPIO%d\n",
+        MIC_PIN_SCK
+    );
+
+    Serial.printf(
+        "LRCL/WS     : GPIO%d\n",
+        MIC_PIN_WS
+    );
+
+
+    return true;
 }
 
 
@@ -172,27 +364,74 @@ static void printHardwareReport()
 
 void setup()
 {
-    Serial.begin(SERIAL_BAUD);
+    Serial.begin(
+        SERIAL_BAUD
+    );
 
     delay(2000);
 
-    printHardwareReport();
-
-    const bool psramOk = testPsram();
 
     Serial.println();
-    Serial.println("================================================");
+    Serial.println(
+        "================================================"
+    );
 
-    if (psramOk)
+    Serial.println(
+        PROJECT_NAME
+    );
+
+    Serial.printf(
+        "Firmware: %s\n",
+        FW_VERSION
+    );
+
+    Serial.println(
+        "Phase 2.4 - ICS-43434 control test"
+    );
+
+    Serial.println(
+        "================================================"
+    );
+
+
+    Serial.printf(
+        "Chip : %s\n",
+        ESP.getChipModel()
+    );
+
+    Serial.printf(
+        "PSRAM: %.2f MiB\n",
+        static_cast<float>(
+            ESP.getPsramSize()
+        ) /
+        (1024.0f * 1024.0f)
+    );
+
+
+    if (!setupMicrophone())
     {
-        Serial.println("PHASE 1 HARDWARE BASELINE: PASS");
-    }
-    else
-    {
-        Serial.println("PHASE 1 HARDWARE BASELINE: FAIL");
+        Serial.println();
+        Serial.println(
+            "I2S INITIALIZATION FAILED"
+        );
+
+        while (true)
+        {
+            delay(1000);
+        }
     }
 
-    Serial.println("================================================");
+
+    Serial.println();
+    Serial.println(
+        "ICS-43434 SEL currently connected to GND."
+    );
+
+    Serial.println(
+        "Comparing both I2S slots."
+    );
+
+    Serial.println();
 }
 
 
@@ -202,24 +441,105 @@ void setup()
 
 void loop()
 {
-    static uint32_t lastHeartbeat = 0;
-    static uint32_t heartbeatCount = 0;
+    static int32_t buffer[
+        MIC_READ_WORDS
+    ];
 
-    const uint32_t now = millis();
 
-    if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS)
+    static ChannelStats slotA;
+    static ChannelStats slotB;
+
+
+    static uint32_t windowStart =
+        millis();
+
+
+    size_t bytesRead = 0;
+
+
+    const esp_err_t result =
+        i2s_read(
+            MIC_I2S_PORT,
+            buffer,
+            sizeof(buffer),
+            &bytesRead,
+            pdMS_TO_TICKS(
+                MIC_READ_TIMEOUT_MS
+            )
+        );
+
+
+    if (result != ESP_OK)
     {
-        lastHeartbeat = now;
-        ++heartbeatCount;
-
         Serial.printf(
-            "[heartbeat %lu] uptime=%lu s free_heap=%u free_psram=%u\n",
-            static_cast<unsigned long>(heartbeatCount),
-            static_cast<unsigned long>(now / 1000),
-            static_cast<unsigned>(ESP.getFreeHeap()),
-            static_cast<unsigned>(ESP.getFreePsram())
+            "I2S read error: %s\n",
+            esp_err_to_name(result)
+        );
+
+        return;
+    }
+
+
+    const size_t wordCount =
+        bytesRead /
+        sizeof(int32_t);
+
+
+    // RIGHT_LEFT mode returns interleaved words.
+    //
+    // We intentionally call them SLOT A and SLOT B
+    // rather than assuming left/right ordering yet.
+    for (
+        size_t i = 0;
+        i + 1 < wordCount;
+        i += 2
+    )
+    {
+        addSample(
+            slotA,
+            buffer[i]
+        );
+
+        addSample(
+            slotB,
+            buffer[i + 1]
         );
     }
 
-    delay(10);
+
+    const uint32_t now =
+        millis();
+
+
+    if (
+        now - windowStart >=
+        AUDIO_REPORT_INTERVAL_MS
+    )
+    {
+        Serial.println(
+            "------------------------------------------------"
+        );
+
+        printStats(
+            "SLOT A",
+            slotA
+        );
+
+        printStats(
+            "SLOT B",
+            slotB
+        );
+
+
+        resetStats(
+            slotA
+        );
+
+        resetStats(
+            slotB
+        );
+
+
+        windowStart = now;
+    }
 }

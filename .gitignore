@@ -16,3 +16,5 @@ include/env.h
 Thumbs.db
 *.swp
 *.tmp
+
+recordings/
