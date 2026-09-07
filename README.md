@@ -1,19 +1,21 @@
 # cisone-garage-sentinel
 <img src="docs/cisone_garage_sentinel_logo.png" alt="Garage roofline and security shield logo with a camera lens, sound waves, and the text cisone garage sentinel in teal on a light gray background" width="50%">
 
-## Version 0.1.0 - August 23 2026
+## Version 0.2.6 - September 7 2026
 
-`cisone-garage-sentinel` is a dedicated garage security node for the **cisOne** system, built around an **ESP32-S3-WROOM N16R8 camera module** and an **INMP441 I2S microphone**.
+`cisone-garage-sentinel` is a dedicated garage security node for the **cisOne** system, built around an **ESP32-S3-WROOM N16R8 camera module** and a **Sipeed I2S_Mic** digital MEMS microphone.
 
-The project is being rebuilt from the ground up after an earlier ESP32-CAM prototype proved useful for experimentation but never produced reliably audible microphone recordings. Development will proceed in tightly controlled phases, with each subsystem validated independently before integration.
+The project is being rebuilt from the ground up after an earlier ESP32-CAM prototype proved useful for experimentation but never produced reliably audible microphone recordings. Development proceeds in tightly controlled phases, with each subsystem validated independently before integration.
+
+**Current state:** ESP32-S3 hardware baseline and microphone proof are complete. Development is now entering **Phase 3 — Stable Audio Subsystem**.
 
 ## Project Goals
 
 The completed device is intended to provide:
 
 - reliable garage video monitoring;
-- continuous INMP441 audio acquisition;
-- recognisable recorded audio;
+- continuous I2S audio acquisition;
+- clearly recognisable recorded audio;
 - acoustic event detection;
 - still-image and video capture;
 - low-light operation;
@@ -23,7 +25,7 @@ The completed device is intended to provide:
 - future motion and person detection;
 - future event-linked audio and image recording.
 
-The project will not progress to higher-level security functions until the lower-level hardware and audio milestones have been proven.
+The project will not progress to higher-level security functions until the lower-level hardware, audio and camera milestones have been proven.
 
 ## Hardware
 
@@ -33,9 +35,25 @@ Current target hardware:
   - 16 MB flash
   - 8 MB PSRAM
 - Camera module
-- INMP441 I2S MEMS microphone
+  - exact sensor and pin mapping to be verified during Phase 4
+- Sipeed I2S_Mic
+  - MSM261S4030H0 digital MEMS microphone
+  - 3.3 V supply
+  - 48 kHz test sample rate
+  - 24-bit microphone data carried in 32-bit I2S slots
+  - current ESP32-S3 connections:
+    - `SD` → GPIO21
+    - `SCK` → GPIO42
+    - `WS` → GPIO41
+    - `L/R` → GND
 
-Additional hardware may be added only after the camera and microphone subsystems are independently validated.
+Previous microphone hardware tested during Phase 2:
+
+- two low-cost INMP441 modules produced structured I2S data but failed the intelligible-audio acceptance test;
+- one ICS-43434 breakout produced no usable I2S data and was rejected;
+- the Sipeed I2S_Mic produced clearly intelligible speech and is now the project reference microphone.
+
+Additional hardware should be added only after the camera and microphone subsystems are independently validated.
 
 ## Development Environment
 
@@ -68,6 +86,10 @@ cisone-garage-sentinel/
 ├── src/
 │   └── main.cpp
 │
+├── tools/
+│   └── capture_wav.py
+│
+├── recordings/          # local test captures; ignored by Git
 ├── lib/
 ├── test/
 └── docs/
@@ -98,23 +120,31 @@ A sanitised template may later be added as:
 include/env.example.h
 ```
 
+Local recordings should also remain outside Git history:
+
+```text
+recordings/
+```
+
 ## Development Principles
 
 ### 1. Validate one subsystem at a time
 
 The previous prototype combined camera, microphone, HTTP, cisOne uploads, triggering, streaming and OTA before the microphone had been fully proven.
 
-This project will avoid that approach.
+This project avoids that approach.
 
-Each phase has a defined acceptance milestone. Development only proceeds when that milestone passes.
+Each phase has a defined acceptance milestone. Development proceeds only when that milestone passes.
 
 ### 2. Audible microphone recording is mandatory
 
-Changing sample values or detecting noise is not sufficient proof that the INMP441 is working correctly.
+Changing sample values or detecting noise is not sufficient proof that a microphone is working correctly.
 
 The microphone milestone is:
 
 > Recorded PCM/WAV audio must contain clearly recognisable speech, claps and other test sounds when played back on the development computer.
+
+This milestone was achieved with the Sipeed I2S_Mic at firmware version `0.2.6`.
 
 ### 3. Camera and microphone must operate concurrently
 
@@ -145,6 +175,8 @@ A powered device must not automatically be considered a healthy security node.
 
 ## Phase 1 — ESP32-S3 Hardware Baseline
 
+**Status: COMPLETE**
+
 ### Objectives
 
 - establish the PlatformIO project;
@@ -171,22 +203,38 @@ PSRAM allocation test   PASS
 Stable heartbeat        PASS
 ```
 
-No camera or microphone functionality is required for Phase 1.
+Phase 1 was completed at version `0.1.1`.
 
-## Phase 2 — INMP441 Microphone Proof
+## Phase 2 — I2S Microphone Proof
+
+**Status: COMPLETE**
 
 ### Objectives
 
-- connect the INMP441 only;
+- connect and test an I2S microphone independently of the camera;
 - configure ESP32-S3 I2S;
-- verify the correct channel and pin configuration;
+- verify channel and pin configuration;
 - inspect raw sample values;
 - determine sample alignment;
 - measure minimum, maximum, peak and RMS levels;
 - capture PCM audio;
 - create a valid WAV recording;
 - transfer the recording to the development computer;
-- listen to the recording.
+- listen to the recording and verify intelligibility.
+
+### Diagnostic History
+
+The original INMP441 modules produced structured I2S data and a clearly isolated active channel, but WAV analysis showed overwhelmingly low-frequency energy and no intelligible speech. Raw stereo-slot capture confirmed that the failure was not explained by serial transfer, WAV construction, simple byte ordering, or left/right selection.
+
+A later ICS-43434 breakout returned effectively zero data on both I2S slots and was rejected as non-functional for this project.
+
+The Sipeed I2S_Mic was then tested using the same ESP32-S3 I2S pins. It produced a strong active slot, responded to acoustic input, and showed a clean 24-bit alignment with the low eight bits of each 32-bit I2S word unused. The working sample extraction is:
+
+```cpp
+sample24 = raw >> 8;
+```
+
+A 10-second mono WAV recorded at 48 kHz contained clearly intelligible speech when played on the development computer.
 
 ### Acceptance Criteria
 
@@ -196,31 +244,77 @@ The recorded audio must contain clearly recognisable:
 - hand claps;
 - nearby environmental sounds.
 
-The project does **not** proceed to Phase 3 until this passes.
+```text
+I2S acquisition         PASS
+Active channel          PASS
+24-bit sample alignment PASS
+WAV construction        PASS
+Serial WAV transfer     PASS
+Intelligible speech     PASS
+```
+
+Phase 2 was completed at version `0.2.6` using the Sipeed I2S_Mic.
 
 ## Phase 3 — Stable Audio Subsystem
 
+**Status: IN PROGRESS**
+
+### Purpose
+
+Phase 3 converts the successful microphone proof into a reliable background audio service suitable for later camera concurrency. Automatic sound-event detection is deliberately deferred until Phase 6.
+
 ### Objectives
 
-- establish reliable continuous I2S acquisition;
-- implement bounded read timeouts;
-- add error counters and recovery;
-- calculate real RMS;
-- calculate calibrated dBFS;
-- establish an audio ring buffer;
-- support repeatable WAV capture;
-- test long-duration microphone operation;
-- monitor heap and PSRAM use.
+- move continuous I2S acquisition into a dedicated FreeRTOS task;
+- keep I2S acquisition running independently of foreground work;
+- implement bounded I2S read timeouts;
+- add read-error, timeout and recovery counters;
+- implement controlled microphone/I2S recovery;
+- calculate continuous RMS and dBFS level windows;
+- establish a circular audio ring buffer in PSRAM;
+- retain several seconds of recent PCM audio continuously;
+- support manual WAV extraction from the buffered audio without stopping acquisition;
+- monitor heap, minimum free heap, PSRAM and task health;
+- perform a 30–60 minute endurance test.
+
+### Proposed Architecture
+
+```text
+Sipeed I2S_Mic
+      │
+      ▼
+Dedicated I2S RX task
+      │
+      ├──► RMS / dBFS monitoring
+      │
+      ├──► error / health counters
+      │
+      └──► circular PSRAM audio buffer
+                    │
+                    ▼
+              manual test capture
+                    │
+                    ▼
+                   WAV
+```
 
 ### Acceptance Criteria
 
-- continuous audio capture remains stable;
-- repeated recordings remain intelligible;
-- no I2S lockups;
-- no progressive memory loss;
-- audio health can be reported accurately.
+- continuous audio acquisition remains stable for at least 30–60 minutes;
+- no I2S lockups or watchdog resets occur;
+- read failures cannot block the device indefinitely;
+- recovery behaviour is observable and controlled;
+- RMS/dBFS values respond sensibly to quiet, speech and impulsive sounds;
+- the PSRAM ring buffer updates continuously;
+- repeated manual WAV extraction remains clearly intelligible;
+- no progressive heap or PSRAM loss is observed;
+- audio subsystem health can be reported accurately.
+
+Phase 3 does **not** require automatic sound triggering, event classification, camera capture or network upload.
 
 ## Phase 4 — Camera Proof
+
+**Status: PENDING**
 
 ### Objectives
 
@@ -241,6 +335,8 @@ The project does **not** proceed to Phase 3 until this passes.
 
 ## Phase 5 — Concurrent Camera and Microphone
 
+**Status: PENDING**
+
 ### Objectives
 
 - run continuous microphone acquisition while the camera is active;
@@ -260,7 +356,11 @@ While live video is being streamed:
 - health reporting continues;
 - no watchdog resets occur.
 
+This phase is a major architectural gate. Camera streaming must never recreate the blocking-audio behaviour of the earlier prototype.
+
 ## Phase 6 — Security Event Detection
+
+**Status: PENDING**
 
 ### Objectives
 
@@ -272,13 +372,16 @@ While live video is being streamed:
 - capture post-trigger audio;
 - associate sound events with camera images;
 - investigate motion detection;
-- investigate person detection.
+- investigate person detection;
+- develop false-positive handling for repetitive motion or sound sources.
 
 ### Acceptance Criteria
 
 A detected event produces a coherent local event record containing appropriate metadata and media without disrupting ongoing monitoring.
 
 ## Phase 7 — cisOne Integration
+
+**Status: PENDING**
 
 ### Objectives
 
@@ -323,36 +426,58 @@ These are deliberately outside the initial hardware validation phases.
 
 # Versioning
 
-The project uses semantic-style firmware versions with an optional development phase suffix.
+The project uses semantic-style firmware versions tied to tested development milestones.
 
-Examples:
+Current progression:
 
 ```text
-0.1.0-phase1
-0.2.0-phase2
-0.3.0-phase3
-1.0.0
-```
+0.1.0   initial repository
+0.1.1   ESP32-S3 hardware baseline complete
 
-Major version `1.0.0` should represent the first stable garage security-node release integrated with cisOne.
+0.2.x   microphone investigation and proof
+0.2.6   first clearly intelligible Sipeed WAV; Phase 2 complete
+0.2.7   dedicated continuous I2S acquisition task
+0.2.8   level monitoring and PSRAM ring buffer
+0.2.9   recovery and endurance testing
+0.3.0   stable audio foundation complete
+
+0.3.x   camera proof
+0.4.0   camera subsystem stable
+
+0.4.x   concurrent audio and camera work
+0.5.0   concurrent subsystem stable
+
+0.5.x   security event engine
+0.6.0   security detection stable
+
+0.6.x   cisOne integration
+0.7.0   integrated Garage Sentinel
+
+1.0.0   first stable deployed garage security node
+```
 
 # Worklog
 
 | Date | Version | Commit name | Milestone / Notes |
 |---|---|---|---|
-| 2026-08-23 | `0.1.0` | `Initialize cisone-garage-sentinel repository` | Created the new PlatformIO project structure, README, phase milestones, configuration layout, and initial ESP32-S3 baseline firmware. |
+| 2026-08-23 | `0.1.0` | `Initialize cisone-garage-sentinel repository` | Created the PlatformIO project structure, README, phase milestones, configuration layout, and initial ESP32-S3 baseline firmware. |
 | 2026-08-24 | `0.1.1` | `Verify ESP32-S3 N16R8 hardware baseline` | Confirmed ESP32-S3 dual-core operation at 240 MHz, 16 MB flash, 8 MB PSRAM, successful 1 MiB PSRAM write/read test, stable serial output and stable heartbeat. Phase 1 complete. |
+| 2026-08-25 | `0.2.0–0.2.4` | `Diagnose INMP441 I2S audio` | Verified I2S clocks, slot isolation, raw 32-bit capture and WAV transfer. Two INMP441 modules produced data but failed the intelligible-audio gate; raw analysis ruled out several software-format explanations. |
+| 2026-09-07 | `0.2.5` | `Verify Sipeed I2S microphone data path` | Reused the 48 kHz stereo-slot diagnostic with the Sipeed I2S_Mic. Confirmed active SLOT A, acoustic response and 24-bit alignment with the low 8 bits unused. |
+| 2026-09-07 | `0.2.6` | `Capture first intelligible Sipeed WAV` | Captured and transferred a 10-second 48 kHz mono WAV using `raw >> 8`; playback contained clearly intelligible speech. Phase 2 complete and Sipeed selected as the reference microphone. |
 
 Add one row for each meaningful tested commit rather than every minor edit.
 
 Suggested commit naming style:
 
 ```text
-Initialize ESP32-S3 hardware baseline
-Verify N16R8 PSRAM
-Add INMP441 I2S acquisition
-Capture first intelligible WAV
-Stabilize continuous audio capture
+Verify ESP32-S3 N16R8 hardware baseline
+Diagnose INMP441 I2S audio
+Verify Sipeed I2S microphone data path
+Capture first intelligible Sipeed WAV
+Add continuous I2S audio task
+Add audio level monitoring and ring buffer
+Verify audio recovery and endurance
 Add camera still capture
 Add concurrent audio and video tasks
 Add acoustic event detection
@@ -361,8 +486,19 @@ Integrate cisOne event upload
 
 # Current Status
 
-**Current phase:** Phase 1 — ESP32-S3 Hardware Baseline
+**Current phase:** Phase 3 — Stable Audio Subsystem
+
+**Completed:**
+
+```text
+Phase 1 — ESP32-S3 Hardware Baseline   PASS
+Phase 2 — I2S Microphone Proof         PASS
+```
+
+**Reference microphone:** Sipeed I2S_Mic / MSM261S4030H0
+
+**Current firmware:** `0.2.6`
 
 Current immediate goal:
 
-> Build, upload and run the minimal ESP32-S3 firmware and confirm the module reports 16 MB flash, 8 MB PSRAM and stable operation before connecting or programming the INMP441.
+> Build version `0.2.7` with a dedicated continuous I2S acquisition task, bounded read timeouts and basic health counters, while preserving the known-good 48 kHz Sipeed microphone configuration and clearly intelligible audio.

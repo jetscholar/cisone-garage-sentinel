@@ -1,215 +1,128 @@
 #include <Arduino.h>
 #include <math.h>
+#include <esp_heap_caps.h>
 
 #include "driver/i2s.h"
 #include "config.h"
 
 
 // ============================================================
-// Per-channel accumulated statistics
+// WAV helpers
 // ============================================================
 
-struct ChannelStats
+static void writeLE16(
+    uint8_t* dst,
+    uint16_t value
+)
 {
-    uint64_t samples = 0;
-
-    int32_t minSample = INT32_MAX;
-    int32_t maxSample = INT32_MIN;
-
-    int64_t peak = 0;
-
-    long double sum = 0.0;
-    long double sumSquares = 0.0;
-
-    uint64_t low7Zero = 0;
-    uint64_t low8Zero = 0;
-};
-
-
-static void resetStats(ChannelStats& s)
-{
-    s.samples = 0;
-
-    s.minSample = INT32_MAX;
-    s.maxSample = INT32_MIN;
-
-    s.peak = 0;
-
-    s.sum = 0.0;
-    s.sumSquares = 0.0;
-
-    s.low7Zero = 0;
-    s.low8Zero = 0;
+    dst[0] = value & 0xFF;
+    dst[1] = (value >> 8) & 0xFF;
 }
 
 
-// ============================================================
-// Add raw 32-bit word
-// ============================================================
-
-static void addSample(
-    ChannelStats& stats,
-    int32_t raw
+static void writeLE32(
+    uint8_t* dst,
+    uint32_t value
 )
 {
-    if (raw < stats.minSample)
-    {
-        stats.minSample = raw;
-    }
-
-    if (raw > stats.maxSample)
-    {
-        stats.maxSample = raw;
-    }
-
-
-    int64_t magnitude =
-        static_cast<int64_t>(raw);
-
-    if (magnitude < 0)
-    {
-        magnitude = -magnitude;
-    }
-
-    if (magnitude > stats.peak)
-    {
-        stats.peak = magnitude;
-    }
-
-
-    stats.sum +=
-        static_cast<long double>(raw);
-
-    stats.sumSquares +=
-        static_cast<long double>(raw) *
-        static_cast<long double>(raw);
-
-
-    const uint32_t u =
-        static_cast<uint32_t>(raw);
-
-    if ((u & 0x7F) == 0)
-    {
-        ++stats.low7Zero;
-    }
-
-    if ((u & 0xFF) == 0)
-    {
-        ++stats.low8Zero;
-    }
-
-
-    ++stats.samples;
+    dst[0] = value & 0xFF;
+    dst[1] = (value >> 8) & 0xFF;
+    dst[2] = (value >> 16) & 0xFF;
+    dst[3] = (value >> 24) & 0xFF;
 }
 
 
-// ============================================================
-// Print one channel
-// ============================================================
-
-static void printStats(
-    const char* name,
-    const ChannelStats& stats
+static void buildWavHeader(
+    uint8_t* header,
+    uint32_t sampleRate,
+    uint32_t sampleCount
 )
 {
-    if (stats.samples == 0)
-    {
-        Serial.printf(
-            "%s: no samples\n",
-            name
-        );
+    const uint16_t channels = 1;
+    const uint16_t bitsPerSample = 16;
 
-        return;
-    }
+    const uint32_t dataBytes =
+        sampleCount *
+        channels *
+        (bitsPerSample / 8);
 
+    const uint32_t byteRate =
+        sampleRate *
+        channels *
+        (bitsPerSample / 8);
 
-    const long double count =
-        static_cast<long double>(
-            stats.samples
-        );
-
-
-    const double mean =
-        static_cast<double>(
-            stats.sum / count
-        );
+    const uint16_t blockAlign =
+        channels *
+        (bitsPerSample / 8);
 
 
-    const double rms =
-        sqrt(
-            static_cast<double>(
-                stats.sumSquares / count
-            )
-        );
-
-
-    const double low7Percent =
-        100.0 *
-        static_cast<double>(
-            stats.low7Zero
-        ) /
-        static_cast<double>(
-            stats.samples
-        );
-
-
-    const double low8Percent =
-        100.0 *
-        static_cast<double>(
-            stats.low8Zero
-        ) /
-        static_cast<double>(
-            stats.samples
-        );
-
-
-    Serial.printf(
-        "%s\n",
-        name
+    memcpy(
+        header + 0,
+        "RIFF",
+        4
     );
 
-    Serial.printf(
-        "  samples       : %llu\n",
-        static_cast<unsigned long long>(
-            stats.samples
-        )
+    writeLE32(
+        header + 4,
+        36 + dataBytes
     );
 
-    Serial.printf(
-        "  raw range     : %ld .. %ld\n",
-        static_cast<long>(
-            stats.minSample
-        ),
-        static_cast<long>(
-            stats.maxSample
-        )
+    memcpy(
+        header + 8,
+        "WAVE",
+        4
     );
 
-    Serial.printf(
-        "  mean/DC       : %.1f\n",
-        mean
+    memcpy(
+        header + 12,
+        "fmt ",
+        4
     );
 
-    Serial.printf(
-        "  RMS           : %.1f\n",
-        rms
+    writeLE32(
+        header + 16,
+        16
     );
 
-    Serial.printf(
-        "  absolute peak : %lld\n",
-        static_cast<long long>(
-            stats.peak
-        )
+    writeLE16(
+        header + 20,
+        1
     );
 
-    Serial.printf(
-        "  low 7 zero    : %.1f %%\n",
-        low7Percent
+    writeLE16(
+        header + 22,
+        channels
     );
 
-    Serial.printf(
-        "  low 8 zero    : %.1f %%\n",
-        low8Percent
+    writeLE32(
+        header + 24,
+        sampleRate
+    );
+
+    writeLE32(
+        header + 28,
+        byteRate
+    );
+
+    writeLE16(
+        header + 32,
+        blockAlign
+    );
+
+    writeLE16(
+        header + 34,
+        bitsPerSample
+    );
+
+    memcpy(
+        header + 36,
+        "data",
+        4
+    );
+
+    writeLE32(
+        header + 40,
+        dataBytes
     );
 }
 
@@ -222,7 +135,7 @@ static bool setupMicrophone()
 {
     Serial.println();
     Serial.println(
-        "---- ICS-43434 I2S setup ----"
+        "---- Sipeed I2S microphone setup ----"
     );
 
 
@@ -238,8 +151,10 @@ static bool setupMicrophone()
         .bits_per_sample =
             I2S_BITS_PER_SAMPLE_32BIT,
 
-        // Capture both slots so we do not assume
-        // the SEL polarity or ESP32 slot ordering.
+        // Capture both slots.
+        // Diagnostic 0.2.5 established that
+        // buffer[0], buffer[2], ... is SLOT A,
+        // which is our active microphone slot.
         .channel_format =
             I2S_CHANNEL_FMT_RIGHT_LEFT,
 
@@ -327,34 +242,645 @@ static bool setupMicrophone()
     );
 
     Serial.println(
-        "Word size   : 32 bit"
+        "I2S slots   : RIGHT_LEFT"
     );
 
     Serial.println(
-        "Slot format : RIGHT_LEFT"
+        "Active slot : SLOT A"
     );
 
     Serial.println(
-        "Processing  : raw / none"
+        "Sample      : raw >> 8 = signed 24-bit"
     );
 
     Serial.printf(
-        "DOUT/SD     : GPIO%d\n",
+        "SD          : GPIO%d\n",
         MIC_PIN_SD
     );
 
     Serial.printf(
-        "BCLK        : GPIO%d\n",
+        "SCK/BCLK    : GPIO%d\n",
         MIC_PIN_SCK
     );
 
     Serial.printf(
-        "LRCL/WS     : GPIO%d\n",
+        "WS/LRCLK    : GPIO%d\n",
         MIC_PIN_WS
     );
 
 
     return true;
+}
+
+
+// ============================================================
+// Discard startup transient
+// ============================================================
+
+static void settleMicrophone()
+{
+    int32_t buffer[MIC_READ_WORDS];
+
+    Serial.printf(
+        "Settling microphone for %u ms...\n",
+        MIC_SETTLE_MS
+    );
+
+
+    const uint32_t start =
+        millis();
+
+
+    while (
+        millis() - start <
+        MIC_SETTLE_MS
+    )
+    {
+        size_t bytesRead = 0;
+
+        i2s_read(
+            MIC_I2S_PORT,
+            buffer,
+            sizeof(buffer),
+            &bytesRead,
+            pdMS_TO_TICKS(
+                MIC_READ_TIMEOUT_MS
+            )
+        );
+    }
+
+
+    i2s_zero_dma_buffer(
+        MIC_I2S_PORT
+    );
+}
+
+
+// ============================================================
+// Capture active SLOT A
+// ============================================================
+
+static bool captureAudio(
+    int32_t* audio24,
+    size_t sampleCount
+)
+{
+    int32_t buffer[
+        MIC_READ_WORDS
+    ];
+
+
+    size_t captured =
+        0;
+
+
+    while (
+        captured <
+        sampleCount
+    )
+    {
+        size_t bytesRead = 0;
+
+
+        const esp_err_t result =
+            i2s_read(
+                MIC_I2S_PORT,
+                buffer,
+                sizeof(buffer),
+                &bytesRead,
+                pdMS_TO_TICKS(
+                    MIC_READ_TIMEOUT_MS
+                )
+            );
+
+
+        if (result != ESP_OK)
+        {
+            Serial.printf(
+                "FAIL: i2s_read(): %s\n",
+                esp_err_to_name(result)
+            );
+
+            return false;
+        }
+
+
+        const size_t wordsRead =
+            bytesRead /
+            sizeof(int32_t);
+
+
+        // Stereo interleaved:
+        //
+        // buffer[0] = SLOT A
+        // buffer[1] = SLOT B
+        // buffer[2] = SLOT A
+        // buffer[3] = SLOT B
+        //
+        // SLOT A was confirmed as active.
+        for (
+            size_t i = 0;
+            i + 1 < wordsRead &&
+            captured < sampleCount;
+            i += 2
+        )
+        {
+            const int32_t raw =
+                buffer[i];
+
+            // Diagnostic showed low 8 bits
+            // are always zero.
+            //
+            // Convert the aligned 32-bit
+            // I2S word to signed 24-bit PCM.
+            audio24[captured] =
+                raw >> 8;
+
+            ++captured;
+        }
+    }
+
+
+    return
+        captured ==
+        sampleCount;
+}
+
+
+// ============================================================
+// Analyse and convert
+// ============================================================
+
+static void convertToPcm16(
+    const int32_t* audio24,
+    int16_t* pcm16,
+    size_t sampleCount
+)
+{
+    int64_t sum =
+        0;
+
+
+    for (
+        size_t i = 0;
+        i < sampleCount;
+        ++i
+    )
+    {
+        sum +=
+            audio24[i];
+    }
+
+
+    const double mean =
+        static_cast<double>(sum) /
+        static_cast<double>(
+            sampleCount
+        );
+
+
+    long double sumSquares =
+        0.0;
+
+
+    int32_t minCentered =
+        INT32_MAX;
+
+    int32_t maxCentered =
+        INT32_MIN;
+
+    int64_t peak =
+        0;
+
+
+    for (
+        size_t i = 0;
+        i < sampleCount;
+        ++i
+    )
+    {
+        const int32_t centered =
+            static_cast<int32_t>(
+                static_cast<double>(
+                    audio24[i]
+                ) - mean
+            );
+
+
+        if (
+            centered <
+            minCentered
+        )
+        {
+            minCentered =
+                centered;
+        }
+
+
+        if (
+            centered >
+            maxCentered
+        )
+        {
+            maxCentered =
+                centered;
+        }
+
+
+        int64_t magnitude =
+            centered;
+
+        if (
+            magnitude < 0
+        )
+        {
+            magnitude =
+                -magnitude;
+        }
+
+
+        if (
+            magnitude > peak
+        )
+        {
+            peak =
+                magnitude;
+        }
+
+
+        sumSquares +=
+            static_cast<long double>(
+                centered
+            ) *
+            static_cast<long double>(
+                centered
+            );
+
+
+        // 24-bit signed PCM -> 16-bit PCM.
+        //
+        // No automatic normalisation.
+        int32_t sample16 =
+            centered >> 8;
+
+
+        if (
+            sample16 > 32767
+        )
+        {
+            sample16 =
+                32767;
+        }
+        else if (
+            sample16 < -32768
+        )
+        {
+            sample16 =
+                -32768;
+        }
+
+
+        pcm16[i] =
+            static_cast<int16_t>(
+                sample16
+            );
+    }
+
+
+    const double rms =
+        sqrt(
+            static_cast<double>(
+                sumSquares /
+                static_cast<long double>(
+                    sampleCount
+                )
+            )
+        );
+
+
+    const double fullScale24 =
+        8388607.0;
+
+
+    const double rmsDbfs =
+        rms > 0.0
+        ? 20.0 *
+          log10(
+              rms /
+              fullScale24
+          )
+        : -120.0;
+
+
+    const double peakDbfs =
+        peak > 0
+        ? 20.0 *
+          log10(
+              static_cast<double>(
+                  peak
+              ) /
+              fullScale24
+          )
+        : -120.0;
+
+
+    Serial.println();
+    Serial.println(
+        "---- Recording analysis ----"
+    );
+
+    Serial.printf(
+        "DC mean       : %.1f\n",
+        mean
+    );
+
+    Serial.printf(
+        "Centered range: %ld .. %ld\n",
+        static_cast<long>(
+            minCentered
+        ),
+        static_cast<long>(
+            maxCentered
+        )
+    );
+
+    Serial.printf(
+        "24-bit RMS    : %.1f\n",
+        rms
+    );
+
+    Serial.printf(
+        "24-bit peak   : %lld\n",
+        static_cast<long long>(
+            peak
+        )
+    );
+
+    Serial.printf(
+        "RMS level     : %.1f dBFS\n",
+        rmsDbfs
+    );
+
+    Serial.printf(
+        "Peak level    : %.1f dBFS\n",
+        peakDbfs
+    );
+
+    Serial.println(
+        "Gain          : 1.0"
+    );
+
+    Serial.println(
+        "Normalisation : OFF"
+    );
+}
+
+
+// ============================================================
+// Record and send WAV
+// ============================================================
+
+static void performRecording()
+{
+    const size_t sampleCount =
+        static_cast<size_t>(
+            MIC_SAMPLE_RATE
+        ) *
+        RECORD_SECONDS;
+
+
+    const size_t audio24Bytes =
+        sampleCount *
+        sizeof(int32_t);
+
+
+    const size_t pcm16Bytes =
+        sampleCount *
+        sizeof(int16_t);
+
+
+    Serial.println();
+    Serial.println(
+        "========================================"
+    );
+
+    Serial.printf(
+        "Recording %u seconds at %u Hz...\n",
+        RECORD_SECONDS,
+        MIC_SAMPLE_RATE
+    );
+
+    Serial.printf(
+        "Samples       : %u\n",
+        static_cast<unsigned>(
+            sampleCount
+        )
+    );
+
+    Serial.printf(
+        "24-bit buffer : %.2f MiB\n",
+        static_cast<double>(
+            audio24Bytes
+        ) /
+        (1024.0 * 1024.0)
+    );
+
+    Serial.printf(
+        "PCM16 buffer  : %.2f KiB\n",
+        static_cast<double>(
+            pcm16Bytes
+        ) /
+        1024.0
+    );
+
+
+    int32_t* audio24 =
+        static_cast<int32_t*>(
+            heap_caps_malloc(
+                audio24Bytes,
+                MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+            )
+        );
+
+
+    if (
+        audio24 == nullptr
+    )
+    {
+        Serial.println(
+            "FAIL: audio24 PSRAM allocation"
+        );
+
+        return;
+    }
+
+
+    int16_t* pcm16 =
+        static_cast<int16_t*>(
+            heap_caps_malloc(
+                pcm16Bytes,
+                MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+            )
+        );
+
+
+    if (
+        pcm16 == nullptr
+    )
+    {
+        Serial.println(
+            "FAIL: pcm16 PSRAM allocation"
+        );
+
+        heap_caps_free(
+            audio24
+        );
+
+        return;
+    }
+
+
+    settleMicrophone();
+
+
+    Serial.println(
+        "CAPTURE START"
+    );
+
+
+    const uint32_t captureStart =
+        millis();
+
+
+    const bool success =
+        captureAudio(
+            audio24,
+            sampleCount
+        );
+
+
+    const uint32_t captureElapsed =
+        millis() -
+        captureStart;
+
+
+    Serial.printf(
+        "CAPTURE END: %u ms\n",
+        captureElapsed
+    );
+
+
+    if (
+        !success
+    )
+    {
+        Serial.println(
+            "FAIL: capture incomplete"
+        );
+
+        heap_caps_free(
+            pcm16
+        );
+
+        heap_caps_free(
+            audio24
+        );
+
+        return;
+    }
+
+
+    convertToPcm16(
+        audio24,
+        pcm16,
+        sampleCount
+    );
+
+
+    uint8_t wavHeader[44];
+
+
+    buildWavHeader(
+        wavHeader,
+        MIC_SAMPLE_RATE,
+        sampleCount
+    );
+
+
+    const size_t wavBytes =
+        sizeof(wavHeader) +
+        pcm16Bytes;
+
+
+    Serial.println();
+    Serial.printf(
+        "WAV bytes     : %u\n",
+        static_cast<unsigned>(
+            wavBytes
+        )
+    );
+
+    Serial.println(
+        "Sending WAV over serial..."
+    );
+
+
+    // Python waits for this exact marker.
+    Serial.printf(
+        "WAV_BEGIN %u\n",
+        static_cast<unsigned>(
+            wavBytes
+        )
+    );
+
+    Serial.flush();
+
+
+    Serial.write(
+        wavHeader,
+        sizeof(wavHeader)
+    );
+
+
+    Serial.write(
+        reinterpret_cast<
+            const uint8_t*
+        >(pcm16),
+        pcm16Bytes
+    );
+
+
+    Serial.flush();
+
+
+    heap_caps_free(
+        pcm16
+    );
+
+    heap_caps_free(
+        audio24
+    );
+
+
+    i2s_zero_dma_buffer(
+        MIC_I2S_PORT
+    );
+
+
+    Serial.println();
+    Serial.println(
+        "WAV_END"
+    );
+
+    Serial.println(
+        "Recording complete."
+    );
+
+    Serial.println(
+        "Send RECORD to repeat."
+    );
 }
 
 
@@ -368,7 +894,14 @@ void setup()
         SERIAL_BAUD
     );
 
-    delay(2000);
+    Serial.setTimeout(
+        100
+    );
+
+
+    delay(
+        2000
+    );
 
 
     Serial.println();
@@ -386,7 +919,7 @@ void setup()
     );
 
     Serial.println(
-        "Phase 2.4 - ICS-43434 control test"
+        "Phase 2.5 - Sipeed microphone WAV proof"
     );
 
     Serial.println(
@@ -408,30 +941,37 @@ void setup()
     );
 
 
-    if (!setupMicrophone())
+    if (
+        !setupMicrophone()
+    )
     {
-        Serial.println();
         Serial.println(
             "I2S INITIALIZATION FAILED"
         );
 
-        while (true)
+        while (
+            true
+        )
         {
-            delay(1000);
+            delay(
+                1000
+            );
         }
     }
 
 
     Serial.println();
     Serial.println(
-        "ICS-43434 SEL currently connected to GND."
+        "Sipeed microphone L/R: GND"
     );
 
     Serial.println(
-        "Comparing both I2S slots."
+        "Ready."
     );
 
-    Serial.println();
+    Serial.println(
+        "Send RECORD for a 10-second WAV."
+    );
 }
 
 
@@ -441,105 +981,31 @@ void setup()
 
 void loop()
 {
-    static int32_t buffer[
-        MIC_READ_WORDS
-    ];
-
-
-    static ChannelStats slotA;
-    static ChannelStats slotB;
-
-
-    static uint32_t windowStart =
-        millis();
-
-
-    size_t bytesRead = 0;
-
-
-    const esp_err_t result =
-        i2s_read(
-            MIC_I2S_PORT,
-            buffer,
-            sizeof(buffer),
-            &bytesRead,
-            pdMS_TO_TICKS(
-                MIC_READ_TIMEOUT_MS
-            )
-        );
-
-
-    if (result != ESP_OK)
-    {
-        Serial.printf(
-            "I2S read error: %s\n",
-            esp_err_to_name(result)
-        );
-
-        return;
-    }
-
-
-    const size_t wordCount =
-        bytesRead /
-        sizeof(int32_t);
-
-
-    // RIGHT_LEFT mode returns interleaved words.
-    //
-    // We intentionally call them SLOT A and SLOT B
-    // rather than assuming left/right ordering yet.
-    for (
-        size_t i = 0;
-        i + 1 < wordCount;
-        i += 2
-    )
-    {
-        addSample(
-            slotA,
-            buffer[i]
-        );
-
-        addSample(
-            slotB,
-            buffer[i + 1]
-        );
-    }
-
-
-    const uint32_t now =
-        millis();
-
-
     if (
-        now - windowStart >=
-        AUDIO_REPORT_INTERVAL_MS
+        Serial.available()
     )
     {
-        Serial.println(
-            "------------------------------------------------"
-        );
-
-        printStats(
-            "SLOT A",
-            slotA
-        );
-
-        printStats(
-            "SLOT B",
-            slotB
-        );
+        String command =
+            Serial.readStringUntil(
+                '\n'
+            );
 
 
-        resetStats(
-            slotA
-        );
-
-        resetStats(
-            slotB
-        );
+        command.trim();
 
 
-        windowStart = now;
+        if (
+            command.equalsIgnoreCase(
+                "RECORD"
+            )
+        )
+        {
+            performRecording();
+        }
     }
+
+
+    delay(
+        10
+    );
 }

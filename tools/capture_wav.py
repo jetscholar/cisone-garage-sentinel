@@ -12,8 +12,14 @@ BAUD = 115200
 def read_exact(ser, count):
     data = bytearray()
 
+    chunk_size = 4096
+
     while len(data) < count:
-        chunk = ser.read(count - len(data))
+        remaining = count - len(data)
+
+        chunk = ser.read(
+            min(chunk_size, remaining)
+        )
 
         if not chunk:
             raise TimeoutError(
@@ -23,13 +29,15 @@ def read_exact(ser, count):
 
         data.extend(chunk)
 
-        percent = (
-            len(data) * 100.0 / count
+        percentage = (
+            len(data) *
+            100.0 /
+            count
         )
 
         print(
             f"\rReceiving WAV: "
-            f"{percent:5.1f}%  "
+            f"{percentage:5.1f}%  "
             f"({len(data)}/{count} bytes)",
             end="",
             flush=True,
@@ -52,23 +60,37 @@ def main():
     port = sys.argv[1]
 
 
-    recordings_dir = (
-        Path(__file__).resolve().parent.parent
-        / "recordings"
+    project_root = (
+        Path(__file__)
+        .resolve()
+        .parent
+        .parent
     )
 
+
+    recordings_dir = (
+        project_root /
+        "recordings"
+    )
+
+
     recordings_dir.mkdir(
+        parents=True,
         exist_ok=True
     )
 
 
-    timestamp = datetime.now().strftime(
-        "%Y%m%d-%H%M%S"
+    timestamp = (
+        datetime.now()
+        .strftime(
+            "%Y%m%d-%H%M%S"
+        )
     )
 
-    output_path = (
-        recordings_dir
-        / f"inmp441-{timestamp}.wav"
+
+    wav_path = (
+        recordings_dir /
+        f"sipeed-i2s-{timestamp}.wav"
     )
 
 
@@ -80,17 +102,19 @@ def main():
     with serial.Serial(
         port,
         BAUD,
-        timeout=20,
+        timeout=30,
     ) as ser:
 
-        # Opening the serial port may reset the ESP32.
+        # Opening COM may reset the ESP32.
         time.sleep(3)
 
         ser.reset_input_buffer()
 
+
         print(
             "Requesting 10-second recording..."
         )
+
 
         ser.write(
             b"RECORD\n"
@@ -99,12 +123,16 @@ def main():
         ser.flush()
 
 
+        wav_size = None
+
+
         while True:
             line = ser.readline()
 
             if not line:
                 raise TimeoutError(
-                    "Timed out waiting for ESP32."
+                    "Timed out waiting "
+                    "for WAV_BEGIN."
                 )
 
 
@@ -121,7 +149,10 @@ def main():
             if text.startswith(
                 "WAV_BEGIN "
             ):
-                parts = text.split()
+                parts = (
+                    text.split()
+                )
+
 
                 if len(parts) != 2:
                     raise RuntimeError(
@@ -138,7 +169,7 @@ def main():
 
 
         print(
-            f"Receiving {wav_size} WAV bytes..."
+            f"Receiving {wav_size} bytes..."
         )
 
 
@@ -148,19 +179,45 @@ def main():
         )
 
 
-        output_path.write_bytes(
-            wav_data
-        )
+    wav_path.write_bytes(
+        wav_data
+    )
 
 
     print()
     print(
-        f"Saved: {output_path}"
+        f"Saved: {wav_path}"
     )
 
     print(
-        f"Size : {output_path.stat().st_size} bytes"
+        f"Size : {len(wav_data)} bytes"
     )
+
+
+    expected_size = (
+        44 +
+        48000 *
+        10 *
+        2
+    )
+
+
+    print(
+        f"Expected: {expected_size} bytes"
+    )
+
+
+    if (
+        len(wav_data) ==
+        expected_size
+    ):
+        print(
+            "WAV size: PASS"
+        )
+    else:
+        print(
+            "WAV size: FAIL"
+        )
 
 
 if __name__ == "__main__":
