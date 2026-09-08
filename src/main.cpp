@@ -1,131 +1,49 @@
 #include <Arduino.h>
 #include <math.h>
-#include <esp_heap_caps.h>
 
 #include "driver/i2s.h"
 #include "config.h"
 
 
 // ============================================================
-// WAV helpers
+// Audio health snapshot
 // ============================================================
 
-static void writeLE16(
-    uint8_t* dst,
-    uint16_t value
-)
+struct AudioSnapshot
 {
-    dst[0] = value & 0xFF;
-    dst[1] = (value >> 8) & 0xFF;
-}
+    bool valid = false;
+
+    uint32_t windowMs = 0;
+    uint32_t lastDataMs = 0;
+
+    uint64_t windowSamples = 0;
+    uint64_t totalSamples = 0;
+
+    double measuredSampleRate = 0.0;
+
+    double dcMean = 0.0;
+    double rms = 0.0;
+    double rmsDbfs = -120.0;
+
+    double peak = 0.0;
+    double peakDbfs = -120.0;
+
+    uint32_t readErrors = 0;
+    uint32_t readTimeouts = 0;
+    uint32_t zeroReads = 0;
+};
 
 
-static void writeLE32(
-    uint8_t* dst,
-    uint32_t value
-)
-{
-    dst[0] = value & 0xFF;
-    dst[1] = (value >> 8) & 0xFF;
-    dst[2] = (value >> 16) & 0xFF;
-    dst[3] = (value >> 24) & 0xFF;
-}
+static AudioSnapshot gAudioSnapshot;
 
+static portMUX_TYPE gAudioSnapshotMux =
+    portMUX_INITIALIZER_UNLOCKED;
 
-static void buildWavHeader(
-    uint8_t* header,
-    uint32_t sampleRate,
-    uint32_t sampleCount
-)
-{
-    const uint16_t channels = 1;
-    const uint16_t bitsPerSample = 16;
+static TaskHandle_t gAudioTaskHandle =
+    nullptr;
 
-    const uint32_t dataBytes =
-        sampleCount *
-        channels *
-        (bitsPerSample / 8);
-
-    const uint32_t byteRate =
-        sampleRate *
-        channels *
-        (bitsPerSample / 8);
-
-    const uint16_t blockAlign =
-        channels *
-        (bitsPerSample / 8);
-
-
-    memcpy(
-        header + 0,
-        "RIFF",
-        4
-    );
-
-    writeLE32(
-        header + 4,
-        36 + dataBytes
-    );
-
-    memcpy(
-        header + 8,
-        "WAVE",
-        4
-    );
-
-    memcpy(
-        header + 12,
-        "fmt ",
-        4
-    );
-
-    writeLE32(
-        header + 16,
-        16
-    );
-
-    writeLE16(
-        header + 20,
-        1
-    );
-
-    writeLE16(
-        header + 22,
-        channels
-    );
-
-    writeLE32(
-        header + 24,
-        sampleRate
-    );
-
-    writeLE32(
-        header + 28,
-        byteRate
-    );
-
-    writeLE16(
-        header + 32,
-        blockAlign
-    );
-
-    writeLE16(
-        header + 34,
-        bitsPerSample
-    );
-
-    memcpy(
-        header + 36,
-        "data",
-        4
-    );
-
-    writeLE32(
-        header + 40,
-        dataBytes
-    );
-}
-
+static volatile uint32_t gLastAudioDataMs =
+	0;
 
 // ============================================================
 // I2S setup
@@ -152,9 +70,7 @@ static bool setupMicrophone()
             I2S_BITS_PER_SAMPLE_32BIT,
 
         // Capture both slots.
-        // Diagnostic 0.2.5 established that
-        // buffer[0], buffer[2], ... is SLOT A,
-        // which is our active microphone slot.
+        // SLOT A is the microphone channel.
         .channel_format =
             I2S_CHANNEL_FMT_RIGHT_LEFT,
 
@@ -250,7 +166,7 @@ static bool setupMicrophone()
     );
 
     Serial.println(
-        "Sample      : raw >> 8 = signed 24-bit"
+        "Sample      : raw >> 8"
     );
 
     Serial.printf(
@@ -274,12 +190,15 @@ static bool setupMicrophone()
 
 
 // ============================================================
-// Discard startup transient
+// Startup settling
 // ============================================================
 
 static void settleMicrophone()
 {
-    int32_t buffer[MIC_READ_WORDS];
+    int32_t buffer[
+        MIC_READ_WORDS
+    ];
+
 
     Serial.printf(
         "Settling microphone for %u ms...\n",
@@ -296,7 +215,9 @@ static void settleMicrophone()
         MIC_SETTLE_MS
     )
     {
-        size_t bytesRead = 0;
+        size_t bytesRead =
+            0;
+
 
         i2s_read(
             MIC_I2S_PORT,
@@ -313,251 +234,105 @@ static void settleMicrophone()
     i2s_zero_dma_buffer(
         MIC_I2S_PORT
     );
+
+
+    Serial.println(
+        "Microphone settled."
+    );
 }
 
 
 // ============================================================
-// Capture active SLOT A
+// Publish completed analysis window
 // ============================================================
 
-static bool captureAudio(
-    int32_t* audio24,
-    size_t sampleCount
+static void publishSnapshot(
+    uint32_t windowMs,
+    uint64_t windowSamples,
+    uint64_t totalSamples,
+    double sum,
+    double sumSquares,
+    int32_t minSample,
+    int32_t maxSample,
+    uint32_t lastDataMs,
+    uint32_t readErrors,
+    uint32_t readTimeouts,
+    uint32_t zeroReads
 )
 {
-    int32_t buffer[
-        MIC_READ_WORDS
-    ];
-
-
-    size_t captured =
-        0;
-
-
-    while (
-        captured <
-        sampleCount
+    if (
+        windowSamples ==
+        0
     )
     {
-        size_t bytesRead = 0;
-
-
-        const esp_err_t result =
-            i2s_read(
-                MIC_I2S_PORT,
-                buffer,
-                sizeof(buffer),
-                &bytesRead,
-                pdMS_TO_TICKS(
-                    MIC_READ_TIMEOUT_MS
-                )
-            );
-
-
-        if (result != ESP_OK)
-        {
-            Serial.printf(
-                "FAIL: i2s_read(): %s\n",
-                esp_err_to_name(result)
-            );
-
-            return false;
-        }
-
-
-        const size_t wordsRead =
-            bytesRead /
-            sizeof(int32_t);
-
-
-        // Stereo interleaved:
-        //
-        // buffer[0] = SLOT A
-        // buffer[1] = SLOT B
-        // buffer[2] = SLOT A
-        // buffer[3] = SLOT B
-        //
-        // SLOT A was confirmed as active.
-        for (
-            size_t i = 0;
-            i + 1 < wordsRead &&
-            captured < sampleCount;
-            i += 2
-        )
-        {
-            const int32_t raw =
-                buffer[i];
-
-            // Diagnostic showed low 8 bits
-            // are always zero.
-            //
-            // Convert the aligned 32-bit
-            // I2S word to signed 24-bit PCM.
-            audio24[captured] =
-                raw >> 8;
-
-            ++captured;
-        }
+        return;
     }
 
 
-    return
-        captured ==
-        sampleCount;
-}
-
-
-// ============================================================
-// Analyse and convert
-// ============================================================
-
-static void convertToPcm16(
-    const int32_t* audio24,
-    int16_t* pcm16,
-    size_t sampleCount
-)
-{
-    int64_t sum =
-        0;
-
-
-    for (
-        size_t i = 0;
-        i < sampleCount;
-        ++i
-    )
-    {
-        sum +=
-            audio24[i];
-    }
-
-
-    const double mean =
-        static_cast<double>(sum) /
+    const double count =
         static_cast<double>(
-            sampleCount
+            windowSamples
         );
 
 
-    long double sumSquares =
-        0.0;
+    const double mean =
+        sum /
+        count;
 
 
-    int32_t minCentered =
-        INT32_MAX;
+    double variance =
+        (
+            sumSquares /
+            count
+        ) -
+        (
+            mean *
+            mean
+        );
 
-    int32_t maxCentered =
-        INT32_MIN;
 
-    int64_t peak =
-        0;
-
-
-    for (
-        size_t i = 0;
-        i < sampleCount;
-        ++i
+    if (
+        variance <
+        0.0
     )
     {
-        const int32_t centered =
-            static_cast<int32_t>(
-                static_cast<double>(
-                    audio24[i]
-                ) - mean
-            );
-
-
-        if (
-            centered <
-            minCentered
-        )
-        {
-            minCentered =
-                centered;
-        }
-
-
-        if (
-            centered >
-            maxCentered
-        )
-        {
-            maxCentered =
-                centered;
-        }
-
-
-        int64_t magnitude =
-            centered;
-
-        if (
-            magnitude < 0
-        )
-        {
-            magnitude =
-                -magnitude;
-        }
-
-
-        if (
-            magnitude > peak
-        )
-        {
-            peak =
-                magnitude;
-        }
-
-
-        sumSquares +=
-            static_cast<long double>(
-                centered
-            ) *
-            static_cast<long double>(
-                centered
-            );
-
-
-        // 24-bit signed PCM -> 16-bit PCM.
-        //
-        // No automatic normalisation.
-        int32_t sample16 =
-            centered >> 8;
-
-
-        if (
-            sample16 > 32767
-        )
-        {
-            sample16 =
-                32767;
-        }
-        else if (
-            sample16 < -32768
-        )
-        {
-            sample16 =
-                -32768;
-        }
-
-
-        pcm16[i] =
-            static_cast<int16_t>(
-                sample16
-            );
+        variance =
+            0.0;
     }
 
 
     const double rms =
         sqrt(
-            static_cast<double>(
-                sumSquares /
-                static_cast<long double>(
-                    sampleCount
-                )
+            variance
+        );
+
+
+    const double minCentered =
+        static_cast<double>(
+            minSample
+        ) -
+        mean;
+
+
+    const double maxCentered =
+        static_cast<double>(
+            maxSample
+        ) -
+        mean;
+
+
+    const double peak =
+        fmax(
+            fabs(
+                minCentered
+            ),
+            fabs(
+                maxCentered
             )
         );
 
 
+    // Signed 24-bit full scale.
     const double fullScale24 =
         8388607.0;
 
@@ -573,313 +348,496 @@ static void convertToPcm16(
 
 
     const double peakDbfs =
-        peak > 0
+        peak > 0.0
         ? 20.0 *
           log10(
-              static_cast<double>(
-                  peak
-              ) /
+              peak /
               fullScale24
           )
         : -120.0;
 
 
-    Serial.println();
-    Serial.println(
-        "---- Recording analysis ----"
-    );
-
-    Serial.printf(
-        "DC mean       : %.1f\n",
-        mean
-    );
-
-    Serial.printf(
-        "Centered range: %ld .. %ld\n",
-        static_cast<long>(
-            minCentered
-        ),
-        static_cast<long>(
-            maxCentered
+    const double measuredRate =
+        windowMs > 0
+        ? (
+            static_cast<double>(
+                windowSamples
+            ) *
+            1000.0 /
+            static_cast<double>(
+                windowMs
+            )
         )
+        : 0.0;
+
+
+    AudioSnapshot snapshot;
+
+    snapshot.valid =
+        true;
+
+    snapshot.windowMs =
+        windowMs;
+
+    snapshot.lastDataMs =
+        lastDataMs;
+
+    snapshot.windowSamples =
+        windowSamples;
+
+    snapshot.totalSamples =
+        totalSamples;
+
+    snapshot.measuredSampleRate =
+        measuredRate;
+
+    snapshot.dcMean =
+        mean;
+
+    snapshot.rms =
+        rms;
+
+    snapshot.rmsDbfs =
+        rmsDbfs;
+
+    snapshot.peak =
+        peak;
+
+    snapshot.peakDbfs =
+        peakDbfs;
+
+    snapshot.readErrors =
+        readErrors;
+
+    snapshot.readTimeouts =
+        readTimeouts;
+
+    snapshot.zeroReads =
+        zeroReads;
+
+
+    portENTER_CRITICAL(
+        &gAudioSnapshotMux
     );
 
-    Serial.printf(
-        "24-bit RMS    : %.1f\n",
-        rms
-    );
+    gAudioSnapshot =
+        snapshot;
 
-    Serial.printf(
-        "24-bit peak   : %lld\n",
-        static_cast<long long>(
-            peak
-        )
-    );
-
-    Serial.printf(
-        "RMS level     : %.1f dBFS\n",
-        rmsDbfs
-    );
-
-    Serial.printf(
-        "Peak level    : %.1f dBFS\n",
-        peakDbfs
-    );
-
-    Serial.println(
-        "Gain          : 1.0"
-    );
-
-    Serial.println(
-        "Normalisation : OFF"
+    portEXIT_CRITICAL(
+        &gAudioSnapshotMux
     );
 }
 
 
 // ============================================================
-// Record and send WAV
+// Continuous audio acquisition task
 // ============================================================
 
-static void performRecording()
+static void audioTask(
+    void* parameter
+)
 {
-    const size_t sampleCount =
-        static_cast<size_t>(
-            MIC_SAMPLE_RATE
-        ) *
-        RECORD_SECONDS;
+    (void)parameter;
 
 
-    const size_t audio24Bytes =
-        sampleCount *
-        sizeof(int32_t);
+    int32_t buffer[
+        MIC_READ_WORDS
+    ];
 
 
-    const size_t pcm16Bytes =
-        sampleCount *
-        sizeof(int16_t);
+    uint64_t totalSamples =
+        0;
 
 
-    Serial.println();
-    Serial.println(
-        "========================================"
-    );
-
-    Serial.printf(
-        "Recording %u seconds at %u Hz...\n",
-        RECORD_SECONDS,
-        MIC_SAMPLE_RATE
-    );
-
-    Serial.printf(
-        "Samples       : %u\n",
-        static_cast<unsigned>(
-            sampleCount
-        )
-    );
-
-    Serial.printf(
-        "24-bit buffer : %.2f MiB\n",
-        static_cast<double>(
-            audio24Bytes
-        ) /
-        (1024.0 * 1024.0)
-    );
-
-    Serial.printf(
-        "PCM16 buffer  : %.2f KiB\n",
-        static_cast<double>(
-            pcm16Bytes
-        ) /
-        1024.0
-    );
+    uint64_t windowSamples =
+        0;
 
 
-    int32_t* audio24 =
-        static_cast<int32_t*>(
-            heap_caps_malloc(
-                audio24Bytes,
-                MALLOC_CAP_SPIRAM |
-                MALLOC_CAP_8BIT
-            )
-        );
+    double sum =
+        0.0;
+
+    double sumSquares =
+        0.0;
 
 
-    if (
-        audio24 == nullptr
-    )
-    {
-        Serial.println(
-            "FAIL: audio24 PSRAM allocation"
-        );
+    int32_t minSample =
+        INT32_MAX;
 
-        return;
-    }
+    int32_t maxSample =
+        INT32_MIN;
 
 
-    int16_t* pcm16 =
-        static_cast<int16_t*>(
-            heap_caps_malloc(
-                pcm16Bytes,
-                MALLOC_CAP_SPIRAM |
-                MALLOC_CAP_8BIT
-            )
-        );
+    uint32_t readErrors =
+        0;
+
+    uint32_t readTimeouts =
+        0;
+
+    uint32_t zeroReads =
+        0;
 
 
-    if (
-        pcm16 == nullptr
-    )
-    {
-        Serial.println(
-            "FAIL: pcm16 PSRAM allocation"
-        );
-
-        heap_caps_free(
-            audio24
-        );
-
-        return;
-    }
-
-
-    settleMicrophone();
-
-
-    Serial.println(
-        "CAPTURE START"
-    );
-
-
-    const uint32_t captureStart =
+    uint32_t lastDataMs =
         millis();
 
 
-    const bool success =
-        captureAudio(
-            audio24,
-            sampleCount
-        );
-
-
-    const uint32_t captureElapsed =
-        millis() -
-        captureStart;
+    uint32_t windowStartMs =
+        millis();
 
 
     Serial.printf(
-        "CAPTURE END: %u ms\n",
-        captureElapsed
+        "Audio task started on Core %d\n",
+        xPortGetCoreID()
+    );
+
+
+    while (
+        true
+    )
+    {
+        size_t bytesRead =
+            0;
+
+
+        const esp_err_t result =
+            i2s_read(
+                MIC_I2S_PORT,
+                buffer,
+                sizeof(buffer),
+                &bytesRead,
+                pdMS_TO_TICKS(
+                    MIC_READ_TIMEOUT_MS
+                )
+            );
+
+
+        if (
+            result ==
+            ESP_ERR_TIMEOUT
+        )
+        {
+            ++readTimeouts;
+
+            continue;
+        }
+
+
+        if (
+            result !=
+            ESP_OK
+        )
+        {
+            ++readErrors;
+
+            // Prevent an unexpected persistent
+            // error from becoming a busy loop.
+            vTaskDelay(
+                pdMS_TO_TICKS(
+                    1
+                )
+            );
+
+            continue;
+        }
+
+
+        if (
+            bytesRead ==
+            0
+        )
+        {
+            ++zeroReads;
+
+            continue;
+        }
+
+
+        lastDataMs =
+            millis();
+
+		gLastAudioDataMs =
+    		lastDataMs;
+
+
+        const size_t wordsRead =
+            bytesRead /
+            sizeof(int32_t);
+
+
+        // RIGHT_LEFT gives:
+        //
+        // [0] SLOT A
+        // [1] SLOT B
+        // [2] SLOT A
+        // [3] SLOT B
+        //
+        // SLOT A is the Sipeed microphone.
+        for (
+            size_t i = 0;
+            i + 1 < wordsRead;
+            i += 2
+        )
+        {
+            const int32_t sample =
+                buffer[i] >>
+                8;
+
+
+            const double value =
+                static_cast<double>(
+                    sample
+                );
+
+
+            sum +=
+                value;
+
+
+            sumSquares +=
+                value *
+                value;
+
+
+            if (
+                sample <
+                minSample
+            )
+            {
+                minSample =
+                    sample;
+            }
+
+
+            if (
+                sample >
+                maxSample
+            )
+            {
+                maxSample =
+                    sample;
+            }
+
+
+            ++windowSamples;
+            ++totalSamples;
+        }
+
+
+        const uint32_t now =
+            millis();
+
+
+        const uint32_t elapsed =
+            now -
+            windowStartMs;
+
+
+        if (
+            elapsed >=
+            AUDIO_ANALYSIS_WINDOW_MS
+        )
+        {
+            publishSnapshot(
+                elapsed,
+                windowSamples,
+                totalSamples,
+                sum,
+                sumSquares,
+                minSample,
+                maxSample,
+                lastDataMs,
+                readErrors,
+                readTimeouts,
+                zeroReads
+            );
+
+
+            windowSamples =
+                0;
+
+            sum =
+                0.0;
+
+            sumSquares =
+                0.0;
+
+            minSample =
+                INT32_MAX;
+
+            maxSample =
+                INT32_MIN;
+
+            windowStartMs =
+                now;
+        }
+    }
+}
+
+
+// ============================================================
+// Audio report
+// ============================================================
+
+static void printAudioReport()
+{
+    AudioSnapshot snapshot;
+
+
+    portENTER_CRITICAL(
+        &gAudioSnapshotMux
+    );
+
+    snapshot =
+        gAudioSnapshot;
+
+    portEXIT_CRITICAL(
+        &gAudioSnapshotMux
     );
 
 
     if (
-        !success
+        !snapshot.valid
     )
     {
         Serial.println(
-            "FAIL: capture incomplete"
-        );
-
-        heap_caps_free(
-            pcm16
-        );
-
-        heap_caps_free(
-            audio24
+            "[AUDIO] Waiting for first analysis window..."
         );
 
         return;
     }
 
 
-    convertToPcm16(
-        audio24,
-        pcm16,
-        sampleCount
-    );
+	const uint32_t liveLastDataMs =
+		gLastAudioDataMs;
+
+	const uint32_t ageMs =
+		millis() -
+		liveLastDataMs;
 
 
-    uint8_t wavHeader[44];
-
-
-    buildWavHeader(
-        wavHeader,
-        MIC_SAMPLE_RATE,
-        sampleCount
-    );
-
-
-    const size_t wavBytes =
-        sizeof(wavHeader) +
-        pcm16Bytes;
-
-
-    Serial.println();
-    Serial.printf(
-        "WAV bytes     : %u\n",
-        static_cast<unsigned>(
-            wavBytes
-        )
-    );
-
-    Serial.println(
-        "Sending WAV over serial..."
-    );
-
-
-    // Python waits for this exact marker.
-    Serial.printf(
-        "WAV_BEGIN %u\n",
-        static_cast<unsigned>(
-            wavBytes
-        )
-    );
-
-    Serial.flush();
-
-
-    Serial.write(
-        wavHeader,
-        sizeof(wavHeader)
-    );
-
-
-    Serial.write(
-        reinterpret_cast<
-            const uint8_t*
-        >(pcm16),
-        pcm16Bytes
-    );
-
-
-    Serial.flush();
-
-
-    heap_caps_free(
-        pcm16
-    );
-
-    heap_caps_free(
-        audio24
-    );
-
-
-    i2s_zero_dma_buffer(
-        MIC_I2S_PORT
-    );
+    const bool healthy =
+        ageMs <=
+        AUDIO_HEALTH_TIMEOUT_MS;
 
 
     Serial.println();
     Serial.println(
-        "WAV_END"
+        "---- Audio health ----"
     );
 
-    Serial.println(
-        "Recording complete."
+
+    Serial.printf(
+        "Health        : %s\n",
+        healthy
+            ? "OK"
+            : "STALE"
     );
 
+
+    Serial.printf(
+        "Sample rate   : %.1f Hz\n",
+        snapshot.measuredSampleRate
+    );
+
+
+    Serial.printf(
+        "Window samples: %llu\n",
+        static_cast<unsigned long long>(
+            snapshot.windowSamples
+        )
+    );
+
+
+    Serial.printf(
+        "Total samples : %llu\n",
+        static_cast<unsigned long long>(
+            snapshot.totalSamples
+        )
+    );
+
+
+    Serial.printf(
+        "DC mean       : %.1f\n",
+        snapshot.dcMean
+    );
+
+
+    Serial.printf(
+        "RMS           : %.1f\n",
+        snapshot.rms
+    );
+
+
+    Serial.printf(
+        "RMS level     : %.1f dBFS\n",
+        snapshot.rmsDbfs
+    );
+
+
+    Serial.printf(
+        "Peak level    : %.1f dBFS\n",
+        snapshot.peakDbfs
+    );
+
+
+    Serial.printf(
+        "Read errors   : %u\n",
+        snapshot.readErrors
+    );
+
+
+    Serial.printf(
+        "Timeouts      : %u\n",
+        snapshot.readTimeouts
+    );
+
+
+    Serial.printf(
+        "Zero reads    : %u\n",
+        snapshot.zeroReads
+    );
+
+
+    Serial.printf(
+        "Last data age : %u ms\n",
+        ageMs
+    );
+}
+
+
+// ============================================================
+// Memory report
+// ============================================================
+
+static void printMemoryReport()
+{
+    Serial.println();
     Serial.println(
-        "Send RECORD to repeat."
+        "---- Memory health ----"
+    );
+
+
+    Serial.printf(
+        "Free heap     : %u bytes\n",
+        static_cast<unsigned>(
+            ESP.getFreeHeap()
+        )
+    );
+
+
+    Serial.printf(
+        "Min free heap : %u bytes\n",
+        static_cast<unsigned>(
+            ESP.getMinFreeHeap()
+        )
+    );
+
+
+    Serial.printf(
+        "Free PSRAM    : %u bytes\n",
+        static_cast<unsigned>(
+            ESP.getFreePsram()
+        )
     );
 }
 
@@ -892,10 +850,6 @@ void setup()
 {
     Serial.begin(
         SERIAL_BAUD
-    );
-
-    Serial.setTimeout(
-        100
     );
 
 
@@ -919,7 +873,7 @@ void setup()
     );
 
     Serial.println(
-        "Phase 2.5 - Sipeed microphone WAV proof"
+        "Phase 3 - Continuous audio acquisition"
     );
 
     Serial.println(
@@ -928,16 +882,20 @@ void setup()
 
 
     Serial.printf(
-        "Chip : %s\n",
+        "Chip  : %s\n",
         ESP.getChipModel()
     );
 
+
     Serial.printf(
-        "PSRAM: %.2f MiB\n",
+        "PSRAM : %.2f MiB\n",
         static_cast<float>(
             ESP.getPsramSize()
         ) /
-        (1024.0f * 1024.0f)
+        (
+            1024.0f *
+            1024.0f
+        )
     );
 
 
@@ -960,48 +918,99 @@ void setup()
     }
 
 
+    settleMicrophone();
+
+
+    const BaseType_t taskResult =
+        xTaskCreatePinnedToCore(
+            audioTask,
+            "audio",
+            AUDIO_TASK_STACK_SIZE,
+            nullptr,
+            AUDIO_TASK_PRIORITY,
+            &gAudioTaskHandle,
+            AUDIO_TASK_CORE
+        );
+
+
+    if (
+        taskResult !=
+        pdPASS
+    )
+    {
+        Serial.println(
+            "FAIL: could not create audio task"
+        );
+
+        while (
+            true
+        )
+        {
+            delay(
+                1000
+            );
+        }
+    }
+
+
     Serial.println();
-    Serial.println(
-        "Sipeed microphone L/R: GND"
+    Serial.printf(
+        "Audio task priority : %d\n",
+        AUDIO_TASK_PRIORITY
+    );
+
+    Serial.printf(
+        "Audio task core     : %d\n",
+        AUDIO_TASK_CORE
     );
 
     Serial.println(
-        "Ready."
-    );
-
-    Serial.println(
-        "Send RECORD for a 10-second WAV."
+        "Continuous acquisition running."
     );
 }
 
 
 // ============================================================
-// Loop
+// Main loop
 // ============================================================
 
 void loop()
 {
+    static uint32_t lastAudioReport =
+        0;
+
+
+    static uint32_t lastMemoryReport =
+        0;
+
+
+    const uint32_t now =
+        millis();
+
+
     if (
-        Serial.available()
+        now -
+        lastAudioReport >=
+        AUDIO_REPORT_INTERVAL_MS
     )
     {
-        String command =
-            Serial.readStringUntil(
-                '\n'
-            );
+        lastAudioReport =
+            now;
+
+        printAudioReport();
+    }
 
 
-        command.trim();
+    if (
+        now -
+        lastMemoryReport >=
+        MEMORY_REPORT_INTERVAL_MS
+    )
+    {
+        lastMemoryReport =
+            now;
 
-
-        if (
-            command.equalsIgnoreCase(
-                "RECORD"
-            )
-        )
-        {
-            performRecording();
-        }
+        printMemoryReport();
     }
 
 
