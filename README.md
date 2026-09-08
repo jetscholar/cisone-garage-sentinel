@@ -465,6 +465,7 @@ Current progression:
 | 2026-08-25 | `0.2.0–0.2.4` | `Diagnose INMP441 I2S audio` | Verified I2S clocks, slot isolation, raw 32-bit capture and WAV transfer. Two INMP441 modules produced data but failed the intelligible-audio gate; raw analysis ruled out several software-format explanations. |
 | 2026-09-07 | `0.2.5` | `Verify Sipeed I2S microphone data path` | Reused the 48 kHz stereo-slot diagnostic with the Sipeed I2S_Mic. Confirmed active SLOT A, acoustic response and 24-bit alignment with the low 8 bits unused. |
 | 2026-09-07 | `0.2.6` | `Capture first intelligible Sipeed WAV` | Captured and transferred a 10-second 48 kHz mono WAV using `raw >> 8`; playback contained clearly intelligible speech. Phase 2 complete and Sipeed selected as the reference microphone. |
+| 2026-09-08 | `0.2.7` | `Stabilize continuous I2S audio acquisition` | Added dedicated FreeRTOS audio acquisition task, live RMS/dBFS and health monitoring, bounded I2S reads and memory diagnostics. Completed approximately 90 minutes of continuous 48 kHz acquisition with zero read errors, zero timeouts, zero-length reads, and stable heap/PSRAM. |
 
 Add one row for each meaningful tested commit rather than every minor edit.
 

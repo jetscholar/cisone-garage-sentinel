@@ -5,7 +5,7 @@
 // ============================================================
 
 #define PROJECT_NAME "cisone-garage-sentinel"
-#define FW_VERSION   "0.2.7"
+#define FW_VERSION   "0.2.8"
 
 #define SERIAL_BAUD 115200
 
@@ -35,21 +35,25 @@
 // Phase 3 continuous audio task
 // ============================================================
 
-// Audio task is provisionally pinned to Core 1.
-// We will revisit core allocation during camera concurrency testing.
 #define AUDIO_TASK_CORE 1
-
 #define AUDIO_TASK_PRIORITY 3
 #define AUDIO_TASK_STACK_SIZE 4096
 
-// Calculate one level window every second.
 #define AUDIO_ANALYSIS_WINDOW_MS 1000
-
-// Print current audio health every two seconds.
 #define AUDIO_REPORT_INTERVAL_MS 2000
-
-// Print memory health every ten seconds.
 #define MEMORY_REPORT_INTERVAL_MS 10000
 
-// No audio data for this long means unhealthy.
 #define AUDIO_HEALTH_TIMEOUT_MS 250
+
+
+// ============================================================
+// Phase 3 PSRAM circular audio buffer
+// ============================================================
+
+// Retain the most recent 10 seconds of audio.
+//
+// 48,000 samples/s
+// × 10 seconds
+// × 2 bytes PCM16
+// = 960,000 bytes
+#define AUDIO_RING_SECONDS 10

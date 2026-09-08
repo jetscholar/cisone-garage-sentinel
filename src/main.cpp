@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <math.h>
+#include <esp_heap_caps.h>
 
 #include "driver/i2s.h"
 #include "config.h"
@@ -42,8 +43,40 @@ static portMUX_TYPE gAudioSnapshotMux =
 static TaskHandle_t gAudioTaskHandle =
     nullptr;
 
+
+// Live timestamp updated directly by the audio task.
+// Health reporting must not depend on the age of
+// the once-per-second analysis snapshot.
 static volatile uint32_t gLastAudioDataMs =
-	0;
+    0;
+
+
+// ============================================================
+// PSRAM circular audio buffer
+// ============================================================
+
+static int16_t* gAudioRing =
+    nullptr;
+
+static size_t gAudioRingCapacitySamples =
+    0;
+
+static size_t gAudioRingWriteIndex =
+    0;
+
+static uint64_t gAudioRingTotalWritten =
+    0;
+
+static uint32_t gAudioRingWraps =
+    0;
+
+static bool gAudioRingFull =
+    false;
+
+
+static portMUX_TYPE gAudioRingMux =
+    portMUX_INITIALIZER_UNLOCKED;
+
 
 // ============================================================
 // I2S setup
@@ -69,8 +102,9 @@ static bool setupMicrophone()
         .bits_per_sample =
             I2S_BITS_PER_SAMPLE_32BIT,
 
-        // Capture both slots.
-        // SLOT A is the microphone channel.
+        // Capture both I2S slots.
+        // Previous diagnostics established that SLOT A
+        // contains the Sipeed microphone data.
         .channel_format =
             I2S_CHANNEL_FMT_RIGHT_LEFT,
 
@@ -118,7 +152,9 @@ static bool setupMicrophone()
         );
 
 
-    if (result != ESP_OK)
+    if (
+        result != ESP_OK
+    )
     {
         Serial.printf(
             "FAIL: i2s_driver_install(): %s\n",
@@ -136,7 +172,9 @@ static bool setupMicrophone()
         );
 
 
-    if (result != ESP_OK)
+    if (
+        result != ESP_OK
+    )
     {
         Serial.printf(
             "FAIL: i2s_set_pin(): %s\n",
@@ -190,7 +228,7 @@ static bool setupMicrophone()
 
 
 // ============================================================
-// Startup settling
+// Microphone startup settling
 // ============================================================
 
 static void settleMicrophone()
@@ -239,6 +277,116 @@ static void settleMicrophone()
     Serial.println(
         "Microphone settled."
     );
+}
+
+
+// ============================================================
+// PSRAM ring-buffer setup
+// ============================================================
+
+static bool setupAudioRing()
+{
+    gAudioRingCapacitySamples =
+        static_cast<size_t>(
+            MIC_SAMPLE_RATE
+        ) *
+        AUDIO_RING_SECONDS;
+
+
+    const size_t ringBytes =
+        gAudioRingCapacitySamples *
+        sizeof(int16_t);
+
+
+    Serial.println();
+    Serial.println(
+        "---- PSRAM audio ring buffer ----"
+    );
+
+
+    Serial.printf(
+        "Duration      : %u seconds\n",
+        AUDIO_RING_SECONDS
+    );
+
+
+    Serial.printf(
+        "Capacity      : %u samples\n",
+        static_cast<unsigned>(
+            gAudioRingCapacitySamples
+        )
+    );
+
+
+    Serial.printf(
+        "Storage       : %u bytes (%.2f KiB)\n",
+        static_cast<unsigned>(
+            ringBytes
+        ),
+        static_cast<double>(
+            ringBytes
+        ) /
+        1024.0
+    );
+
+
+    gAudioRing =
+        static_cast<int16_t*>(
+            heap_caps_malloc(
+                ringBytes,
+                MALLOC_CAP_SPIRAM |
+                MALLOC_CAP_8BIT
+            )
+        );
+
+
+    if (
+        gAudioRing ==
+        nullptr
+    )
+    {
+        Serial.println(
+            "FAIL: PSRAM ring-buffer allocation"
+        );
+
+        return false;
+    }
+
+
+    memset(
+        gAudioRing,
+        0,
+        ringBytes
+    );
+
+
+    gAudioRingWriteIndex =
+        0;
+
+    gAudioRingTotalWritten =
+        0;
+
+    gAudioRingWraps =
+        0;
+
+    gAudioRingFull =
+        false;
+
+
+    Serial.println(
+        "Ring buffer allocation: PASS"
+    );
+
+
+    Serial.printf(
+        "Free PSRAM    : %u bytes\n",
+        static_cast<unsigned>(
+            ESP.getFreePsram()
+        )
+    );
+
+
+    return true;
 }
 
 
@@ -332,7 +480,7 @@ static void publishSnapshot(
         );
 
 
-    // Signed 24-bit full scale.
+    // Signed 24-bit PCM full scale.
     const double fullScale24 =
         8388607.0;
 
@@ -372,6 +520,7 @@ static void publishSnapshot(
 
 
     AudioSnapshot snapshot;
+
 
     snapshot.valid =
         true;
@@ -448,7 +597,6 @@ static void audioTask(
     uint64_t totalSamples =
         0;
 
-
     uint64_t windowSamples =
         0;
 
@@ -480,9 +628,23 @@ static void audioTask(
     uint32_t lastDataMs =
         millis();
 
-
     uint32_t windowStartMs =
         millis();
+
+
+    // Keep frequently updated ring state local to the
+    // audio task. Only publish metadata periodically.
+    size_t ringWriteIndex =
+        0;
+
+    uint64_t ringTotalWritten =
+        0;
+
+    uint32_t ringWraps =
+        0;
+
+    bool ringFull =
+        false;
 
 
     Serial.printf(
@@ -529,13 +691,15 @@ static void audioTask(
         {
             ++readErrors;
 
-            // Prevent an unexpected persistent
-            // error from becoming a busy loop.
+
+            // Avoid a busy loop if an unexpected
+            // persistent I2S error occurs.
             vTaskDelay(
                 pdMS_TO_TICKS(
                     1
                 )
             );
+
 
             continue;
         }
@@ -555,8 +719,9 @@ static void audioTask(
         lastDataMs =
             millis();
 
-		gLastAudioDataMs =
-    		lastDataMs;
+
+        gLastAudioDataMs =
+            lastDataMs;
 
 
         const size_t wordsRead =
@@ -564,28 +729,88 @@ static void audioTask(
             sizeof(int32_t);
 
 
-        // RIGHT_LEFT gives:
+        // RIGHT_LEFT produces:
         //
-        // [0] SLOT A
-        // [1] SLOT B
-        // [2] SLOT A
-        // [3] SLOT B
+        // buffer[0] = SLOT A
+        // buffer[1] = SLOT B
+        // buffer[2] = SLOT A
+        // buffer[3] = SLOT B
         //
-        // SLOT A is the Sipeed microphone.
+        // SLOT A contains the microphone data.
         for (
             size_t i = 0;
             i + 1 < wordsRead;
             i += 2
         )
         {
-            const int32_t sample =
+            // Convert aligned I2S word to signed
+            // 24-bit microphone sample.
+            const int32_t sample24 =
                 buffer[i] >>
                 8;
 
 
+            // ------------------------------------------------
+            // Store rolling PCM16 audio in PSRAM
+            // ------------------------------------------------
+
+            int32_t sample16 =
+                sample24 >>
+                8;
+
+
+            if (
+                sample16 >
+                32767
+            )
+            {
+                sample16 =
+                    32767;
+            }
+            else if (
+                sample16 <
+                -32768
+            )
+            {
+                sample16 =
+                    -32768;
+            }
+
+
+            gAudioRing[
+                ringWriteIndex
+            ] =
+                static_cast<int16_t>(
+                    sample16
+                );
+
+
+            ++ringWriteIndex;
+            ++ringTotalWritten;
+
+
+            if (
+                ringWriteIndex >=
+                gAudioRingCapacitySamples
+            )
+            {
+                ringWriteIndex =
+                    0;
+
+                ++ringWraps;
+
+                ringFull =
+                    true;
+            }
+
+
+            // ------------------------------------------------
+            // Existing 24-bit analysis
+            // ------------------------------------------------
+
             const double value =
                 static_cast<double>(
-                    sample
+                    sample24
                 );
 
 
@@ -599,28 +824,52 @@ static void audioTask(
 
 
             if (
-                sample <
+                sample24 <
                 minSample
             )
             {
                 minSample =
-                    sample;
+                    sample24;
             }
 
 
             if (
-                sample >
+                sample24 >
                 maxSample
             )
             {
                 maxSample =
-                    sample;
+                    sample24;
             }
 
 
             ++windowSamples;
             ++totalSamples;
         }
+
+
+        // Publish only ring metadata under the critical
+        // section. The actual audio writes are never
+        // performed while interrupts are locked.
+        portENTER_CRITICAL(
+            &gAudioRingMux
+        );
+
+        gAudioRingWriteIndex =
+            ringWriteIndex;
+
+        gAudioRingTotalWritten =
+            ringTotalWritten;
+
+        gAudioRingWraps =
+            ringWraps;
+
+        gAudioRingFull =
+            ringFull;
+
+        portEXIT_CRITICAL(
+            &gAudioRingMux
+        );
 
 
         const uint32_t now =
@@ -675,7 +924,7 @@ static void audioTask(
 
 
 // ============================================================
-// Audio report
+// Audio health report
 // ============================================================
 
 static void printAudioReport()
@@ -707,12 +956,13 @@ static void printAudioReport()
     }
 
 
-	const uint32_t liveLastDataMs =
-		gLastAudioDataMs;
+    const uint32_t liveLastDataMs =
+        gLastAudioDataMs;
 
-	const uint32_t ageMs =
-		millis() -
-		liveLastDataMs;
+
+    const uint32_t ageMs =
+        millis() -
+        liveLastDataMs;
 
 
     const bool healthy =
@@ -806,6 +1056,134 @@ static void printAudioReport()
 
 
 // ============================================================
+// Ring-buffer report
+// ============================================================
+
+static void printRingReport()
+{
+    size_t writeIndex;
+    uint64_t totalWritten;
+    uint32_t wraps;
+    bool full;
+
+
+    portENTER_CRITICAL(
+        &gAudioRingMux
+    );
+
+    writeIndex =
+        gAudioRingWriteIndex;
+
+    totalWritten =
+        gAudioRingTotalWritten;
+
+    wraps =
+        gAudioRingWraps;
+
+    full =
+        gAudioRingFull;
+
+    portEXIT_CRITICAL(
+        &gAudioRingMux
+    );
+
+
+    const uint64_t retainedSamples =
+        totalWritten >=
+        gAudioRingCapacitySamples
+        ? gAudioRingCapacitySamples
+        : totalWritten;
+
+
+    const double retainedSeconds =
+        static_cast<double>(
+            retainedSamples
+        ) /
+        static_cast<double>(
+            MIC_SAMPLE_RATE
+        );
+
+
+    const double fillPercent =
+        gAudioRingCapacitySamples > 0
+        ? (
+            100.0 *
+            static_cast<double>(
+                retainedSamples
+            ) /
+            static_cast<double>(
+                gAudioRingCapacitySamples
+            )
+        )
+        : 0.0;
+
+
+    Serial.println();
+    Serial.println(
+        "---- Audio ring buffer ----"
+    );
+
+
+    Serial.printf(
+        "Capacity      : %u samples\n",
+        static_cast<unsigned>(
+            gAudioRingCapacitySamples
+        )
+    );
+
+
+    Serial.printf(
+        "Retained      : %llu samples\n",
+        static_cast<unsigned long long>(
+            retainedSamples
+        )
+    );
+
+
+    Serial.printf(
+        "Retained time : %.2f seconds\n",
+        retainedSeconds
+    );
+
+
+    Serial.printf(
+        "Fill          : %.1f %%\n",
+        fillPercent
+    );
+
+
+    Serial.printf(
+        "Write index   : %u\n",
+        static_cast<unsigned>(
+            writeIndex
+        )
+    );
+
+
+    Serial.printf(
+        "Wraps         : %u\n",
+        wraps
+    );
+
+
+    Serial.printf(
+        "Total written : %llu\n",
+        static_cast<unsigned long long>(
+            totalWritten
+        )
+    );
+
+
+    Serial.printf(
+        "Full          : %s\n",
+        full
+            ? "YES"
+            : "NO"
+    );
+}
+
+
+// ============================================================
 // Memory report
 // ============================================================
 
@@ -839,6 +1217,9 @@ static void printMemoryReport()
             ESP.getFreePsram()
         )
     );
+
+
+    printRingReport();
 }
 
 
@@ -873,7 +1254,7 @@ void setup()
     );
 
     Serial.println(
-        "Phase 3 - Continuous audio acquisition"
+        "Phase 3 - PSRAM circular audio buffer"
     );
 
     Serial.println(
@@ -907,6 +1288,7 @@ void setup()
             "I2S INITIALIZATION FAILED"
         );
 
+
         while (
             true
         )
@@ -919,6 +1301,26 @@ void setup()
 
 
     settleMicrophone();
+
+
+    if (
+        !setupAudioRing()
+    )
+    {
+        Serial.println(
+            "AUDIO RING INITIALIZATION FAILED"
+        );
+
+
+        while (
+            true
+        )
+        {
+            delay(
+                1000
+            );
+        }
+    }
 
 
     const BaseType_t taskResult =
@@ -942,6 +1344,7 @@ void setup()
             "FAIL: could not create audio task"
         );
 
+
         while (
             true
         )
@@ -954,18 +1357,26 @@ void setup()
 
 
     Serial.println();
+
+
     Serial.printf(
         "Audio task priority : %d\n",
         AUDIO_TASK_PRIORITY
     );
+
 
     Serial.printf(
         "Audio task core     : %d\n",
         AUDIO_TASK_CORE
     );
 
+
     Serial.println(
         "Continuous acquisition running."
+    );
+
+    Serial.println(
+        "Rolling 10-second audio buffer running."
     );
 }
 
@@ -997,6 +1408,7 @@ void loop()
         lastAudioReport =
             now;
 
+
         printAudioReport();
     }
 
@@ -1009,6 +1421,7 @@ void loop()
     {
         lastMemoryReport =
             now;
+
 
         printMemoryReport();
     }
