@@ -5,7 +5,7 @@
 // ============================================================
 
 #define PROJECT_NAME "cisone-garage-sentinel"
-#define FW_VERSION   "0.2.8"
+#define FW_VERSION   "0.2.9"
 
 #define SERIAL_BAUD 115200
 

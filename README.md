@@ -466,6 +466,7 @@ Current progression:
 | 2026-09-07 | `0.2.5` | `Verify Sipeed I2S microphone data path` | Reused the 48 kHz stereo-slot diagnostic with the Sipeed I2S_Mic. Confirmed active SLOT A, acoustic response and 24-bit alignment with the low 8 bits unused. |
 | 2026-09-07 | `0.2.6` | `Capture first intelligible Sipeed WAV` | Captured and transferred a 10-second 48 kHz mono WAV using `raw >> 8`; playback contained clearly intelligible speech. Phase 2 complete and Sipeed selected as the reference microphone. |
 | 2026-09-08 | `0.2.7` | `Stabilize continuous I2S audio acquisition` | Added dedicated FreeRTOS audio acquisition task, live RMS/dBFS and health monitoring, bounded I2S reads and memory diagnostics. Completed approximately 90 minutes of continuous 48 kHz acquisition with zero read errors, zero timeouts, zero-length reads, and stable heap/PSRAM. |
+| 2026-09-08 | `0.2.9` | `Prove rolling audio snapshot integrity` | Added dual PSRAM audio rings with atomic active/frozen buffer swapping and WAV snapshot transfer. Verified 10-second mono 48 kHz/16-bit WAV output with intelligible speech in correct chronological order while continuous I2S acquisition remained active. |
 
 Add one row for each meaningful tested commit rather than every minor edit.
 

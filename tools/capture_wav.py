@@ -1,123 +1,126 @@
-import sys
+import argparse
+import datetime
+import pathlib
+import re
 import time
-from datetime import datetime
-from pathlib import Path
+import wave
 
 import serial
 
 
-BAUD = 115200
-
-
-def read_exact(ser, count):
-    data = bytearray()
-
-    chunk_size = 4096
-
-    while len(data) < count:
-        remaining = count - len(data)
-
-        chunk = ser.read(
-            min(chunk_size, remaining)
-        )
-
-        if not chunk:
-            raise TimeoutError(
-                f"Serial timeout after "
-                f"{len(data)}/{count} bytes"
-            )
-
-        data.extend(chunk)
-
-        percentage = (
-            len(data) *
-            100.0 /
-            count
-        )
-
-        print(
-            f"\rReceiving WAV: "
-            f"{percentage:5.1f}%  "
-            f"({len(data)}/{count} bytes)",
-            end="",
-            flush=True,
-        )
-
-    print()
-
-    return bytes(data)
-
-
 def main():
-    if len(sys.argv) < 2:
-        print(
-            "Usage: capture_wav.py COM4"
-        )
+    parser = argparse.ArgumentParser()
 
-        raise SystemExit(1)
-
-
-    port = sys.argv[1]
-
-
-    project_root = (
-        Path(__file__)
-        .resolve()
-        .parent
-        .parent
+    parser.add_argument(
+        "port",
+        help="ESP32 serial port, e.g. COM4",
     )
 
+    parser.add_argument(
+        "--baud",
+        type=int,
+        default=115200,
+    )
 
-    recordings_dir = (
-        project_root /
+    args = parser.parse_args()
+
+
+    recordings_dir = pathlib.Path(
         "recordings"
     )
 
-
     recordings_dir.mkdir(
-        parents=True,
         exist_ok=True
     )
 
 
-    timestamp = (
-        datetime.now()
-        .strftime(
-            "%Y%m%d-%H%M%S"
-        )
+    timestamp = datetime.datetime.now().strftime(
+        "%Y%m%d-%H%M%S"
     )
 
 
-    wav_path = (
-        recordings_dir /
-        f"sipeed-i2s-{timestamp}.wav"
+    output_path = recordings_dir / (
+        f"ring-snapshot-{timestamp}.wav"
     )
 
 
     print(
-        f"Opening {port} at {BAUD} baud..."
+        f"Opening {args.port} at {args.baud} baud..."
     )
 
 
     with serial.Serial(
-        port,
-        BAUD,
-        timeout=30,
+        args.port,
+        args.baud,
+        timeout=2,
     ) as ser:
 
-        # Opening COM may reset the ESP32.
-        time.sleep(3)
+        # Opening the ESP32 serial device may reset it.
+        # Give the firmware enough time to boot and fill
+        # the first 10-second ring.
+        print(
+            "Waiting 12 seconds for ring buffer to fill..."
+        )
 
+        end_time = time.time() + 12
+
+
+        while time.time() < end_time:
+            line = ser.readline()
+
+            if line:
+                try:
+                    print(
+                        line.decode(
+                            errors="replace"
+                        ).rstrip()
+                    )
+                except Exception:
+                    pass
+
+
+        print()
+        print(
+            "Ring should now be full."
+        )
+
+        print(
+            "Speak a test sequence now."
+        )
+
+        print(
+            "Snapshot will be requested in 10 seconds..."
+        )
+
+
+        # This 10-second interval becomes the audio
+        # expected in the frozen rolling buffer.
+        for remaining in range(
+            10,
+            0,
+            -1
+        ):
+            print(
+                f"{remaining}..."
+            )
+
+            time.sleep(
+                1
+            )
+
+
+        # Discard old textual health output before
+        # requesting binary transfer.
         ser.reset_input_buffer()
 
 
         print(
-            "Requesting 10-second recording..."
+            "Requesting snapshot..."
         )
 
 
         ser.write(
-            b"RECORD\n"
+            b"s\n"
         )
 
         ser.flush()
@@ -130,94 +133,110 @@ def main():
             line = ser.readline()
 
             if not line:
-                raise TimeoutError(
-                    "Timed out waiting "
-                    "for WAV_BEGIN."
-                )
+                continue
 
 
-            text = line.decode(
-                "utf-8",
-                errors="replace"
-            ).strip()
+            match = re.match(
+                rb"WAV_BEGIN\s+(\d+)",
+                line.strip(),
+            )
 
 
-            if text:
-                print(text)
-
-
-            if text.startswith(
-                "WAV_BEGIN "
-            ):
-                parts = (
-                    text.split()
-                )
-
-
-                if len(parts) != 2:
-                    raise RuntimeError(
-                        f"Bad WAV_BEGIN marker: "
-                        f"{text}"
-                    )
-
-
+            if match:
                 wav_size = int(
-                    parts[1]
+                    match.group(1)
                 )
 
                 break
 
 
+            try:
+                print(
+                    line.decode(
+                        errors="replace"
+                    ).rstrip()
+                )
+            except Exception:
+                pass
+
+
         print(
-            f"Receiving {wav_size} bytes..."
+            f"Receiving {wav_size} WAV bytes..."
         )
 
 
-        wav_data = read_exact(
-            ser,
-            wav_size
+        remaining = wav_size
+
+
+        with output_path.open(
+            "wb"
+        ) as output:
+
+            while remaining > 0:
+                chunk = ser.read(
+                    min(
+                        4096,
+                        remaining,
+                    )
+                )
+
+
+                if not chunk:
+                    raise RuntimeError(
+                        "Timed out while receiving WAV data"
+                    )
+
+
+                output.write(
+                    chunk
+                )
+
+                remaining -= len(
+                    chunk
+                )
+
+
+        print(
+            f"Saved: {output_path}"
         )
 
 
-    wav_path.write_bytes(
-        wav_data
-    )
+    with wave.open(
+        str(output_path),
+        "rb",
+    ) as wav:
+
+        channels = wav.getnchannels()
+        rate = wav.getframerate()
+        width = wav.getsampwidth()
+        frames = wav.getnframes()
+
+        duration = (
+            frames /
+            float(rate)
+        )
 
 
     print()
     print(
-        f"Saved: {wav_path}"
+        f"Channels    : {channels}"
     )
 
     print(
-        f"Size : {len(wav_data)} bytes"
+        f"Sample rate : {rate} Hz"
     )
-
-
-    expected_size = (
-        44 +
-        48000 *
-        10 *
-        2
-    )
-
 
     print(
-        f"Expected: {expected_size} bytes"
+        f"Sample width: {width * 8} bit"
     )
 
+    print(
+        f"Frames      : {frames}"
+    )
 
-    if (
-        len(wav_data) ==
-        expected_size
-    ):
-        print(
-            "WAV size: PASS"
-        )
-    else:
-        print(
-            "WAV size: FAIL"
-        )
+    print(
+        f"Duration    : {duration:.2f} seconds"
+    )
 
 
 if __name__ == "__main__":
