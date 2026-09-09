@@ -467,6 +467,7 @@ Current progression:
 | 2026-09-07 | `0.2.6` | `Capture first intelligible Sipeed WAV` | Captured and transferred a 10-second 48 kHz mono WAV using `raw >> 8`; playback contained clearly intelligible speech. Phase 2 complete and Sipeed selected as the reference microphone. |
 | 2026-09-08 | `0.2.7` | `Stabilize continuous I2S audio acquisition` | Added dedicated FreeRTOS audio acquisition task, live RMS/dBFS and health monitoring, bounded I2S reads and memory diagnostics. Completed approximately 90 minutes of continuous 48 kHz acquisition with zero read errors, zero timeouts, zero-length reads, and stable heap/PSRAM. |
 | 2026-09-08 | `0.2.9` | `Prove rolling audio snapshot integrity` | Added dual PSRAM audio rings with atomic active/frozen buffer swapping and WAV snapshot transfer. Verified 10-second mono 48 kHz/16-bit WAV output with intelligible speech in correct chronological order while continuous I2S acquisition remained active. |
+| 2026-09-09 | `0.2.10` | `Harden audio recovery and snapshot handling` | Added controlled I2S recovery and dual-ring snapshot stress testing. Fixed audio-task stack overflow by moving the shared I2S read buffer out of the task stack. Verified successful in-place I2S recovery, fresh ring refill after recovery, three consecutive 10-second WAV snapshots with Ring A/B alternation, valid 48 kHz mono PCM16 output, and uninterrupted audio acquisition during transfers. |
 
 Add one row for each meaningful tested commit rather than every minor edit.
 
@@ -488,19 +489,11 @@ Integrate cisOne event upload
 
 # Current Status
 
-**Current phase:** Phase 3 — Stable Audio Subsystem
+**Current phase:** Phase 3 — Stable Audio Subsystem — **COMPLETE**
 
 **Completed:**
 
 ```text
-Phase 1 — ESP32-S3 Hardware Baseline   PASS
-Phase 2 — I2S Microphone Proof         PASS
-```
-
-**Reference microphone:** Sipeed I2S_Mic / MSM261S4030H0
-
-**Current firmware:** `0.2.6`
-
-Current immediate goal:
-
-> Build version `0.2.7` with a dedicated continuous I2S acquisition task, bounded read timeouts and basic health counters, while preserving the known-good 48 kHz Sipeed microphone configuration and clearly intelligible audio.
+Phase 1 — ESP32-S3 Hardware Baseline    PASS
+Phase 2 — I2S Microphone Proof          PASS
+Phase 3 — Stable Audio Subsystem        PASS

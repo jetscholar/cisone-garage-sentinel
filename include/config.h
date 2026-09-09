@@ -5,7 +5,7 @@
 // ============================================================
 
 #define PROJECT_NAME "cisone-garage-sentinel"
-#define FW_VERSION   "0.2.9"
+#define FW_VERSION   "0.2.10"
 
 #define SERIAL_BAUD 115200
 
@@ -57,3 +57,14 @@
 // × 2 bytes PCM16
 // = 960,000 bytes
 #define AUDIO_RING_SECONDS 10
+
+// ============================================================
+// Phase 3 audio recovery
+// ============================================================
+
+// Five consecutive failed/empty reads at a 100 ms read timeout
+// corresponds to roughly 500 ms without useful audio.
+#define AUDIO_RECOVERY_FAILURE_THRESHOLD 5
+
+// Discard startup transient after rebuilding the I2S driver.
+#define AUDIO_RECOVERY_SETTLE_MS 250

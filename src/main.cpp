@@ -32,6 +32,10 @@ struct AudioSnapshot
     uint32_t readErrors = 0;
     uint32_t readTimeouts = 0;
     uint32_t zeroReads = 0;
+
+    uint32_t recoveryAttempts = 0;
+    uint32_t recoverySuccesses = 0;
+    uint32_t recoveryFailures = 0;
 };
 
 
@@ -48,7 +52,7 @@ static volatile uint32_t gLastAudioDataMs =
 
 
 // ============================================================
-// Double PSRAM ring buffers
+// Dual PSRAM ring buffers
 // ============================================================
 
 struct AudioRing
@@ -82,21 +86,71 @@ static volatile bool gSnapshotReady =
     false;
 
 
+static uint32_t gSnapshotCount =
+    0;
+
+static uint32_t gSnapshotRejected =
+    0;
+
+
 static portMUX_TYPE gRingMux =
     portMUX_INITIALIZER_UNLOCKED;
 
 
 // ============================================================
-// I2S
+// Recovery state
 // ============================================================
 
-static bool setupMicrophone()
-{
-    Serial.println();
-    Serial.println(
-        "---- Sipeed I2S microphone setup ----"
-    );
+static volatile bool gRecoveryRequest =
+    false;
 
+
+// ============================================================
+// Ring helpers
+// ============================================================
+
+static const char* ringName(
+    const AudioRing* ring
+)
+{
+    if (ring == &gRingA)
+    {
+        return "Ring A";
+    }
+
+    if (ring == &gRingB)
+    {
+        return "Ring B";
+    }
+
+    return "NONE";
+}
+
+
+static void resetRingMetadata(
+    AudioRing* ring
+)
+{
+    if (ring == nullptr)
+    {
+        return;
+    }
+
+    ring->writeIndex = 0;
+    ring->totalWritten = 0;
+    ring->wraps = 0;
+    ring->full = false;
+}
+
+
+// ============================================================
+// I2S configuration
+// ============================================================
+
+static bool installMicrophoneDriver(
+    bool verbose
+)
+{
     const i2s_config_t i2sConfig = {
         .mode = static_cast<i2s_mode_t>(
             I2S_MODE_MASTER |
@@ -158,10 +212,13 @@ static bool setupMicrophone()
 
     if (result != ESP_OK)
     {
-        Serial.printf(
-            "FAIL: i2s_driver_install(): %s\n",
-            esp_err_to_name(result)
-        );
+        if (verbose)
+        {
+            Serial.printf(
+                "FAIL: i2s_driver_install(): %s\n",
+                esp_err_to_name(result)
+            );
+        }
 
         return false;
     }
@@ -176,9 +233,16 @@ static bool setupMicrophone()
 
     if (result != ESP_OK)
     {
-        Serial.printf(
-            "FAIL: i2s_set_pin(): %s\n",
-            esp_err_to_name(result)
+        if (verbose)
+        {
+            Serial.printf(
+                "FAIL: i2s_set_pin(): %s\n",
+                esp_err_to_name(result)
+            );
+        }
+
+        i2s_driver_uninstall(
+            MIC_I2S_PORT
         );
 
         return false;
@@ -188,6 +252,24 @@ static bool setupMicrophone()
     i2s_zero_dma_buffer(
         MIC_I2S_PORT
     );
+
+
+    return true;
+}
+
+
+static bool setupMicrophone()
+{
+    Serial.println();
+    Serial.println(
+        "---- Sipeed I2S microphone setup ----"
+    );
+
+
+    if (!installMicrophoneDriver(true))
+    {
+        return false;
+    }
 
 
     Serial.printf(
@@ -226,39 +308,43 @@ static bool setupMicrophone()
     return true;
 }
 
+// ============================================================
+// Shared I2S read buffer
+// ============================================================
+//
+// Used sequentially by startup settling, normal acquisition,
+// and recovery. It lives in static memory rather than on the
+// FreeRTOS task stack.
+
+static int32_t gI2sBuffer[
+    MIC_READ_WORDS
+];
 
 // ============================================================
-// Microphone settling
+// Settle/discard startup samples
 // ============================================================
 
-static void settleMicrophone()
+static void discardAudioFor(
+    uint32_t durationMs
+)
 {
-    int32_t buffer[
-        MIC_READ_WORDS
-    ];
-
-
-    Serial.printf(
-        "Settling microphone for %u ms...\n",
-        MIC_SETTLE_MS
-    );
-
-
     const uint32_t start =
         millis();
 
 
     while (
         millis() - start <
-        MIC_SETTLE_MS
+        durationMs
     )
     {
-        size_t bytesRead = 0;
+        size_t bytesRead =
+            0;
+
 
         i2s_read(
             MIC_I2S_PORT,
-            buffer,
-            sizeof(buffer),
+            gI2sBuffer,
+            sizeof(gI2sBuffer),
             &bytesRead,
             pdMS_TO_TICKS(
                 MIC_READ_TIMEOUT_MS
@@ -270,6 +356,20 @@ static void settleMicrophone()
     i2s_zero_dma_buffer(
         MIC_I2S_PORT
     );
+}
+
+
+static void settleMicrophone()
+{
+    Serial.printf(
+        "Settling microphone for %u ms...\n",
+        MIC_SETTLE_MS
+    );
+
+
+    discardAudioFor(
+        MIC_SETTLE_MS
+    );
 
 
     Serial.println(
@@ -279,7 +379,61 @@ static void settleMicrophone()
 
 
 // ============================================================
-// Ring allocation
+// Controlled I2S recovery
+// ============================================================
+
+static bool recoverMicrophone()
+{
+    Serial.println();
+    Serial.println(
+        "---- I2S recovery ----"
+    );
+
+    Serial.println(
+        "Rebuilding microphone driver..."
+    );
+
+
+    // The audio task is the only code that calls i2s_read(),
+    // so recovery can safely rebuild the driver here.
+    i2s_driver_uninstall(
+        MIC_I2S_PORT
+    );
+
+
+    vTaskDelay(
+        pdMS_TO_TICKS(
+            20
+        )
+    );
+
+
+    if (!installMicrophoneDriver(false))
+    {
+        Serial.println(
+            "Recovery result : FAIL"
+        );
+
+        return false;
+    }
+
+
+    discardAudioFor(
+        AUDIO_RECOVERY_SETTLE_MS
+    );
+
+
+    Serial.println(
+        "Recovery result : PASS"
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// PSRAM rings
 // ============================================================
 
 static bool allocateRing(
@@ -327,10 +481,9 @@ static bool allocateRing(
     );
 
 
-    ring.writeIndex = 0;
-    ring.totalWritten = 0;
-    ring.wraps = 0;
-    ring.full = false;
+    resetRingMetadata(
+        &ring
+    );
 
 
     Serial.printf(
@@ -411,7 +564,7 @@ static bool setupAudioRings()
 
 
 // ============================================================
-// Analysis snapshot
+// Publish audio analysis snapshot
 // ============================================================
 
 static void publishSnapshot(
@@ -425,7 +578,10 @@ static void publishSnapshot(
     uint32_t lastDataMs,
     uint32_t readErrors,
     uint32_t readTimeouts,
-    uint32_t zeroReads
+    uint32_t zeroReads,
+    uint32_t recoveryAttempts,
+    uint32_t recoverySuccesses,
+    uint32_t recoveryFailures
 )
 {
     if (windowSamples == 0)
@@ -533,7 +689,8 @@ static void publishSnapshot(
 
     AudioSnapshot snapshot;
 
-    snapshot.valid = true;
+    snapshot.valid =
+        true;
 
     snapshot.windowMs =
         windowMs;
@@ -574,6 +731,15 @@ static void publishSnapshot(
     snapshot.zeroReads =
         zeroReads;
 
+    snapshot.recoveryAttempts =
+        recoveryAttempts;
+
+    snapshot.recoverySuccesses =
+        recoverySuccesses;
+
+    snapshot.recoveryFailures =
+        recoveryFailures;
+
 
     portENTER_CRITICAL(
         &gAudioSnapshotMux
@@ -598,10 +764,6 @@ static void audioTask(
 {
     (void)parameter;
 
-
-    int32_t buffer[
-        MIC_READ_WORDS
-    ];
 
 
     uint64_t totalSamples =
@@ -632,6 +794,20 @@ static void audioTask(
         0;
 
     uint32_t zeroReads =
+        0;
+
+
+    uint32_t recoveryAttempts =
+        0;
+
+    uint32_t recoverySuccesses =
+        0;
+
+    uint32_t recoveryFailures =
+        0;
+
+
+    uint32_t consecutiveFailures =
         0;
 
 
@@ -667,25 +843,177 @@ static void audioTask(
 
     while (true)
     {
+        // ----------------------------------------------------
+        // Manual or automatic recovery
+        // ----------------------------------------------------
+
+        bool performRecovery =
+            false;
+
+
+        if (gRecoveryRequest)
+        {
+            gRecoveryRequest =
+                false;
+
+            performRecovery =
+                true;
+
+            Serial.println();
+            Serial.println(
+                "[RECOVERY] Manual recovery requested."
+            );
+        }
+        else if (
+            consecutiveFailures >=
+            AUDIO_RECOVERY_FAILURE_THRESHOLD
+        )
+        {
+            performRecovery =
+                true;
+
+            Serial.printf(
+                "\n[RECOVERY] %u consecutive read failures.\n",
+                consecutiveFailures
+            );
+        }
+
+
+        if (performRecovery)
+        {
+            ++recoveryAttempts;
+
+
+            const bool recovered =
+                recoverMicrophone();
+
+
+            if (recovered)
+            {
+                ++recoverySuccesses;
+
+                consecutiveFailures =
+                    0;
+
+
+                // Do not allow a snapshot containing
+                // an unknown gap across recovery.
+                //
+                // Start a fresh retention window.
+                portENTER_CRITICAL(
+                    &gRingMux
+                );
+
+                resetRingMetadata(
+                    activeRing
+                );
+
+                portEXIT_CRITICAL(
+                    &gRingMux
+                );
+
+
+                ringWriteIndex =
+                    0;
+
+                ringTotalWritten =
+                    0;
+
+                ringWraps =
+                    0;
+
+                ringFull =
+                    false;
+
+
+                windowSamples =
+                    0;
+
+                sum =
+                    0.0;
+
+                sumSquares =
+                    0.0;
+
+                minSample =
+                    INT32_MAX;
+
+                maxSample =
+                    INT32_MIN;
+
+                windowStartMs =
+                    millis();
+
+
+                Serial.printf(
+                    "Recovery attempts : %u\n",
+                    recoveryAttempts
+                );
+
+                Serial.printf(
+                    "Recovery successes: %u\n",
+                    recoverySuccesses
+                );
+
+                Serial.println(
+                    "Active ring reset : YES"
+                );
+
+                Serial.println(
+                    "Refilling fresh 10-second history."
+                );
+            }
+            else
+            {
+                ++recoveryFailures;
+
+                consecutiveFailures =
+                    0;
+
+
+                Serial.printf(
+                    "Recovery failures : %u\n",
+                    recoveryFailures
+                );
+
+
+                vTaskDelay(
+                    pdMS_TO_TICKS(
+                        250
+                    )
+                );
+            }
+
+
+            continue;
+        }
+
+
+        // ----------------------------------------------------
+        // Normal I2S acquisition
+        // ----------------------------------------------------
+
         size_t bytesRead =
             0;
 
 
         const esp_err_t result =
             i2s_read(
-                MIC_I2S_PORT,
-                buffer,
-                sizeof(buffer),
-                &bytesRead,
-                pdMS_TO_TICKS(
-                    MIC_READ_TIMEOUT_MS
-                )
-            );
+				MIC_I2S_PORT,
+				gI2sBuffer,
+				sizeof(gI2sBuffer),
+				&bytesRead,
+				pdMS_TO_TICKS(
+					MIC_READ_TIMEOUT_MS
+				)
+			);
 
 
         if (result == ESP_ERR_TIMEOUT)
         {
             ++readTimeouts;
+            ++consecutiveFailures;
+
             continue;
         }
 
@@ -693,12 +1021,15 @@ static void audioTask(
         if (result != ESP_OK)
         {
             ++readErrors;
+            ++consecutiveFailures;
+
 
             vTaskDelay(
                 pdMS_TO_TICKS(
                     1
                 )
             );
+
 
             continue;
         }
@@ -707,8 +1038,14 @@ static void audioTask(
         if (bytesRead == 0)
         {
             ++zeroReads;
+            ++consecutiveFailures;
+
             continue;
         }
+
+
+        consecutiveFailures =
+            0;
 
 
         lastDataMs =
@@ -723,6 +1060,9 @@ static void audioTask(
             sizeof(int32_t);
 
 
+        // RIGHT_LEFT:
+        // even words = SLOT A
+        // odd words  = SLOT B
         for (
             size_t i = 0;
             i + 1 < wordsRead;
@@ -730,7 +1070,7 @@ static void audioTask(
         )
         {
             const int32_t sample24 =
-                buffer[i] >>
+                gI2sBuffer[i] >>
                 8;
 
 
@@ -741,11 +1081,13 @@ static void audioTask(
 
             if (sample16 > 32767)
             {
-                sample16 = 32767;
+                sample16 =
+                    32767;
             }
             else if (sample16 < -32768)
             {
-                sample16 = -32768;
+                sample16 =
+                    -32768;
             }
 
 
@@ -766,11 +1108,13 @@ static void audioTask(
                 activeRing->capacity
             )
             {
-                ringWriteIndex = 0;
+                ringWriteIndex =
+                    0;
 
                 ++ringWraps;
 
-                ringFull = true;
+                ringFull =
+                    true;
             }
 
 
@@ -807,10 +1151,14 @@ static void audioTask(
         }
 
 
-        // Publish current active-ring metadata.
+        // ----------------------------------------------------
+        // Publish ring metadata and service snapshot request
+        // ----------------------------------------------------
+
         portENTER_CRITICAL(
             &gRingMux
         );
+
 
         activeRing->writeIndex =
             ringWriteIndex;
@@ -825,11 +1173,6 @@ static void audioTask(
             ringFull;
 
 
-        // Snapshot requests are serviced only at an
-        // I2S block boundary.
-        //
-        // No PCM data is copied here. We simply swap
-        // active and frozen ring pointers.
         if (
             gSnapshotRequest &&
             !gSnapshotReady
@@ -848,10 +1191,9 @@ static void audioTask(
                 : &gRingA;
 
 
-            newRing->writeIndex = 0;
-            newRing->totalWritten = 0;
-            newRing->wraps = 0;
-            newRing->full = false;
+            resetRingMetadata(
+                newRing
+            );
 
 
             gFrozenRing =
@@ -868,13 +1210,24 @@ static void audioTask(
                 true;
 
 
+            ++gSnapshotCount;
+
+
             activeRing =
                 newRing;
 
-            ringWriteIndex = 0;
-            ringTotalWritten = 0;
-            ringWraps = 0;
-            ringFull = false;
+
+            ringWriteIndex =
+                0;
+
+            ringTotalWritten =
+                0;
+
+            ringWraps =
+                0;
+
+            ringFull =
+                false;
         }
 
 
@@ -882,6 +1235,10 @@ static void audioTask(
             &gRingMux
         );
 
+
+        // ----------------------------------------------------
+        // Analysis window
+        // ----------------------------------------------------
 
         const uint32_t now =
             millis();
@@ -908,15 +1265,21 @@ static void audioTask(
                 lastDataMs,
                 readErrors,
                 readTimeouts,
-                zeroReads
+                zeroReads,
+                recoveryAttempts,
+                recoverySuccesses,
+                recoveryFailures
             );
 
 
-            windowSamples = 0;
+            windowSamples =
+                0;
 
-            sum = 0.0;
+            sum =
+                0.0;
 
-            sumSquares = 0.0;
+            sumSquares =
+                0.0;
 
             minSample =
                 INT32_MAX;
@@ -932,7 +1295,7 @@ static void audioTask(
 
 
 // ============================================================
-// Audio report
+// Snapshot accessor
 // ============================================================
 
 static AudioSnapshot getAudioSnapshot()
@@ -955,6 +1318,10 @@ static AudioSnapshot getAudioSnapshot()
     return snapshot;
 }
 
+
+// ============================================================
+// Health reporting
+// ============================================================
 
 static void printAudioReport()
 {
@@ -1061,6 +1428,19 @@ static void printAudioReport()
 
 
     Serial.printf(
+        "Recoveries    : %u/%u\n",
+        snapshot.recoverySuccesses,
+        snapshot.recoveryAttempts
+    );
+
+
+    Serial.printf(
+        "Recovery fail : %u\n",
+        snapshot.recoveryFailures
+    );
+
+
+    Serial.printf(
         "Last data age : %u ms\n",
         ageMs
     );
@@ -1068,19 +1448,13 @@ static void printAudioReport()
 
 
 // ============================================================
-// Active ring report
+// Ring reporting
 // ============================================================
 
 static void printRingReport()
 {
-    size_t capacity;
-    size_t writeIndex;
-
-    uint64_t totalWritten;
-
-    uint32_t wraps;
-
-    bool full;
+    AudioRing ringCopy;
+    const char* activeName;
 
 
     portENTER_CRITICAL(
@@ -1092,20 +1466,14 @@ static void printRingReport()
         gActiveRing;
 
 
-    capacity =
-        active->capacity;
+    activeName =
+        ringName(
+            active
+        );
 
-    writeIndex =
-        active->writeIndex;
 
-    totalWritten =
-        active->totalWritten;
-
-    wraps =
-        active->wraps;
-
-    full =
-        active->full;
+    ringCopy =
+        *active;
 
 
     portEXIT_CRITICAL(
@@ -1114,9 +1482,10 @@ static void printRingReport()
 
 
     const uint64_t retained =
-        totalWritten >= capacity
-        ? capacity
-        : totalWritten;
+        ringCopy.totalWritten >=
+        ringCopy.capacity
+        ? ringCopy.capacity
+        : ringCopy.totalWritten;
 
 
     const double seconds =
@@ -1133,9 +1502,15 @@ static void printRingReport()
 
 
     Serial.printf(
+        "Active        : %s\n",
+        activeName
+    );
+
+
+    Serial.printf(
         "Capacity      : %u samples\n",
         static_cast<unsigned>(
-            capacity
+            ringCopy.capacity
         )
     );
 
@@ -1157,36 +1532,48 @@ static void printRingReport()
     Serial.printf(
         "Write index   : %u\n",
         static_cast<unsigned>(
-            writeIndex
+            ringCopy.writeIndex
         )
     );
 
 
     Serial.printf(
         "Wraps         : %u\n",
-        wraps
+        ringCopy.wraps
     );
 
 
     Serial.printf(
         "Total written : %llu\n",
         static_cast<unsigned long long>(
-            totalWritten
+            ringCopy.totalWritten
         )
     );
 
 
     Serial.printf(
         "Full          : %s\n",
-        full
+        ringCopy.full
             ? "YES"
             : "NO"
+    );
+
+
+    Serial.printf(
+        "Snapshots     : %u\n",
+        gSnapshotCount
+    );
+
+
+    Serial.printf(
+        "Rejected      : %u\n",
+        gSnapshotRejected
     );
 }
 
 
 // ============================================================
-// Memory
+// Memory report
 // ============================================================
 
 static void printMemoryReport()
@@ -1253,6 +1640,10 @@ static void requestSnapshot()
         allowed =
             true;
     }
+    else
+    {
+        ++gSnapshotRejected;
+    }
 
 
     portEXIT_CRITICAL(
@@ -1263,15 +1654,16 @@ static void requestSnapshot()
     if (allowed)
     {
         Serial.println();
-        Serial.println(
-            "Snapshot requested."
+        Serial.printf(
+            "Snapshot request #%u accepted.\n",
+            gSnapshotCount + 1
         );
     }
     else
     {
         Serial.println();
         Serial.println(
-            "Snapshot rejected: active ring is not full or another snapshot is pending."
+            "Snapshot rejected: ring not full or snapshot busy."
         );
     }
 }
@@ -1441,7 +1833,7 @@ static void buildWavHeader(
 
 
 // ============================================================
-// Binary serial writer
+// Binary serial transfer
 // ============================================================
 
 static void writePcmToSerial(
@@ -1499,7 +1891,7 @@ static void writePcmToSerial(
 
 
 // ============================================================
-// Frozen ring WAV transfer
+// Frozen WAV transfer
 // ============================================================
 
 static void transmitFrozenWav()
@@ -1519,6 +1911,9 @@ static void transmitFrozenWav()
 
     bool full =
         false;
+
+    uint32_t snapshotNumber =
+        0;
 
 
     portENTER_CRITICAL(
@@ -1545,6 +1940,9 @@ static void transmitFrozenWav()
 
         full =
             frozen->full;
+
+        snapshotNumber =
+            gSnapshotCount;
     }
 
 
@@ -1596,7 +1994,29 @@ static void transmitFrozenWav()
 
     Serial.println();
     Serial.println(
-        "Snapshot ready."
+        "---- Snapshot transfer ----"
+    );
+
+
+    Serial.printf(
+        "Snapshot       : %u\n",
+        snapshotNumber
+    );
+
+
+    Serial.printf(
+        "Frozen ring    : %s\n",
+        ringName(
+            frozen
+        )
+    );
+
+
+    Serial.printf(
+        "Active ring    : %s\n",
+        ringName(
+            gActiveRing
+        )
     );
 
 
@@ -1627,8 +2047,6 @@ static void transmitFrozenWav()
     );
 
 
-    // capture_wav.py looks for this line,
-    // then reads exactly wavBytes binary bytes.
     Serial.printf(
         "WAV_BEGIN %u\n",
         static_cast<unsigned>(
@@ -1648,10 +2066,6 @@ static void transmitFrozenWav()
 
     if (full)
     {
-        // In a full circular buffer, writeIndex is
-        // the next write location and therefore also
-        // the oldest retained sample.
-
         const size_t firstSegment =
             capacity -
             writeIndex;
@@ -1690,8 +2104,6 @@ static void transmitFrozenWav()
     );
 
 
-    // Release the frozen ring so that it can become
-    // the active buffer at the next snapshot.
     portENTER_CRITICAL(
         &gRingMux
     );
@@ -1716,83 +2128,77 @@ static void transmitFrozenWav()
         getAudioSnapshot();
 
 
+    const uint32_t ageMs =
+        millis() -
+        gLastAudioDataMs;
+
+
     Serial.println();
     Serial.println(
         "---- Snapshot concurrency check ----"
     );
 
 
-    if (
-        before.valid &&
-        after.valid
-    )
-    {
-        Serial.printf(
-            "Samples before : %llu\n",
-            static_cast<unsigned long long>(
-                before.totalSamples
-            )
-        );
+    Serial.printf(
+        "Samples before : %llu\n",
+        static_cast<unsigned long long>(
+            before.totalSamples
+        )
+    );
 
 
-        Serial.printf(
-            "Samples after  : %llu\n",
-            static_cast<unsigned long long>(
-                after.totalSamples
-            )
-        );
+    Serial.printf(
+        "Samples after  : %llu\n",
+        static_cast<unsigned long long>(
+            after.totalSamples
+        )
+    );
 
 
-        Serial.printf(
-            "Samples gained : %llu\n",
-            static_cast<unsigned long long>(
-                after.totalSamples -
-                before.totalSamples
-            )
-        );
+    Serial.printf(
+        "Samples gained : %llu\n",
+        static_cast<unsigned long long>(
+            after.totalSamples -
+            before.totalSamples
+        )
+    );
 
 
-        Serial.printf(
-            "Read errors    : %u\n",
-            after.readErrors
-        );
+    Serial.printf(
+        "Read errors    : %u\n",
+        after.readErrors
+    );
 
 
-        Serial.printf(
-            "Timeouts       : %u\n",
-            after.readTimeouts
-        );
+    Serial.printf(
+        "Timeouts       : %u\n",
+        after.readTimeouts
+    );
 
 
-        Serial.printf(
-            "Zero reads     : %u\n",
-            after.zeroReads
-        );
+    Serial.printf(
+        "Zero reads     : %u\n",
+        after.zeroReads
+    );
 
 
-        const uint32_t ageMs =
-            millis() -
-            gLastAudioDataMs;
+    Serial.printf(
+        "Last data age  : %u ms\n",
+        ageMs
+    );
 
 
-        Serial.printf(
-            "Last data age  : %u ms\n",
-            ageMs
-        );
-
-
-        Serial.printf(
-            "Audio continued: %s\n",
-            (
-                after.totalSamples >
-                before.totalSamples &&
-                ageMs <=
-                AUDIO_HEALTH_TIMEOUT_MS
-            )
-            ? "YES"
-            : "NO"
-        );
-    }
+    Serial.printf(
+        "Audio continued: %s\n",
+        (
+            after.totalSamples >
+            before.totalSamples &&
+            ageMs <=
+            AUDIO_HEALTH_TIMEOUT_MS
+        )
+        ? "YES"
+        : "NO"
+    );
 }
 
 
@@ -1816,6 +2222,14 @@ static void pollSerialCommands()
         )
         {
             requestSnapshot();
+        }
+        else if (
+            command == 'r' ||
+            command == 'R'
+        )
+        {
+            gRecoveryRequest =
+                true;
         }
     }
 }
@@ -1852,7 +2266,7 @@ void setup()
     );
 
     Serial.println(
-        "Phase 3 - rolling audio snapshot proof"
+        "Phase 3 - audio recovery and snapshot stress"
     );
 
     Serial.println(
@@ -1884,6 +2298,7 @@ void setup()
             "I2S INITIALIZATION FAILED"
         );
 
+
         while (true)
         {
             delay(
@@ -1901,6 +2316,7 @@ void setup()
         Serial.println(
             "AUDIO RING INITIALIZATION FAILED"
         );
+
 
         while (true)
         {
@@ -1929,6 +2345,7 @@ void setup()
             "FAIL: could not create audio task"
         );
 
+
         while (true)
         {
             delay(
@@ -1939,6 +2356,7 @@ void setup()
 
 
     Serial.println();
+
 
     Serial.printf(
         "Audio task priority : %d\n",
@@ -1960,8 +2378,17 @@ void setup()
         "Dual rolling audio buffers running."
     );
 
+    Serial.println();
     Serial.println(
-        "Send 's' to snapshot the previous 10 seconds."
+        "Commands:"
+    );
+
+    Serial.println(
+        "  s = snapshot previous 10 seconds"
+    );
+
+    Serial.println(
+        "  r = force I2S recovery test"
     );
 }
 
